@@ -6,7 +6,7 @@ export default function History() {
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    axios.get('http://localhost:8000/history')
+    axios.get('https://verifii-backend.onrender.com/history')
       .then(res => setHistory(res.data))
       .catch(() => setHistory([]))
       .finally(() => setLoading(false))

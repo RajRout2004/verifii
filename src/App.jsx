@@ -4,7 +4,7 @@ import SearchBar from './components/searchbar'
 import ResultCard from './components/resultcard'
 import History from './components/history'
 
-const API = 'http://localhost:8000'
+const API = 'http://locahttps://verifii-backend.onrender.com/verifylhost:8000'
 
 function App() {
   const [activeTab, setActiveTab] = useState('search')

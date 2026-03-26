@@ -1,14 +1,14 @@
-import httpx
+import os
 import json
 import re
+from groq import Groq
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "mistral"
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+MODEL = "llama-3.3-70b-versatile"
 
 
 def build_prompt(query: str, gst_data: dict, web_data: dict) -> str:
 
-    # ── GST Section ──────────────────────────────────────────────────────────
     gst_section = ""
     if gst_data:
         gst_section = f"""
@@ -24,7 +24,6 @@ def build_prompt(query: str, gst_data: dict, web_data: dict) -> str:
 Note: {gst_data.get('note', '')}
 """
 
-    # ── Google Reviews ────────────────────────────────────────────────────────
     reviews_section = ""
     if web_data.get("google_reviews"):
         r = web_data["google_reviews"]
@@ -34,7 +33,6 @@ Note: {gst_data.get('note', '')}
 Snippets: {snippets or 'None found'}
 """
 
-    # ── Fraud & Complaints ────────────────────────────────────────────────────
     fraud_section = ""
     if web_data.get("google_fraud") or web_data.get("google_complaints"):
         fraud = web_data.get("google_fraud", {})
@@ -47,7 +45,6 @@ Snippets: {snippets or 'None found'}
 - Complaint snippets: {'; '.join(complaints.get('complaint_snippets', [])) or 'None'}
 """
 
-    # ── B2B Marketplaces ──────────────────────────────────────────────────────
     marketplace_section = ""
     indiamart = web_data.get("indiamart", {})
     tradeindia = web_data.get("tradeindia", {})
@@ -59,18 +56,15 @@ IndiaMART:
   - Found: {indiamart.get('found', False)}
   - Companies: {', '.join(indiamart.get('companies_found', [])) or 'None'}
   - Verified listings: {indiamart.get('verified_count', 0)}
-  - Years listed: {', '.join(indiamart.get('years_listed', [])) or 'N/A'}
 TradeIndia:
   - Found: {tradeindia.get('found', False)}
   - Companies: {', '.join(tradeindia.get('companies_found', [])) or 'None'}
-  - Verified: {tradeindia.get('verified_count', 0)}
 Justdial:
   - Found: {justdial.get('found', False)}
   - Businesses: {', '.join(justdial.get('businesses_found', [])) or 'None'}
   - Ratings: {', '.join(justdial.get('ratings', [])) or 'None'}
 """
 
-    # ── MCA Portal ────────────────────────────────────────────────────────────
     mca_section = ""
     mca = web_data.get("mca", {})
     if mca:
@@ -85,23 +79,10 @@ Justdial:
 - Status: {c.get('status', 'N/A')}
 - Incorporation Date: {c.get('incorporation_date', 'N/A')}
 - Company Type: {c.get('type', 'N/A')}
-- State: {c.get('state', 'N/A')}
 """
         else:
             mca_section = "\n=== MCA ===\n- Not found on MCA portal\n"
 
-    # ── Zauba Corp ────────────────────────────────────────────────────────────
-    zauba_section = ""
-    zauba = web_data.get("zauba", {})
-    if zauba and zauba.get("found"):
-        companies = zauba.get("companies", [])
-        zauba_section = f"""
-=== ZAUBA CORP (COMPANY REGISTRY) ===
-- Found: {zauba.get('found', False)}
-- Companies: {json.dumps(companies[:2])}
-"""
-
-    # ── LinkedIn ──────────────────────────────────────────────────────────────
     linkedin_section = ""
     linkedin = web_data.get("linkedin", {})
     if linkedin:
@@ -111,7 +92,6 @@ Justdial:
 - Links: {', '.join(linkedin.get('links', [])) or 'None found'}
 """
 
-    # ── Website Analysis ──────────────────────────────────────────────────────
     website_section = ""
     website = web_data.get("website", {})
     if website:
@@ -119,18 +99,14 @@ Justdial:
 === WEBSITE ANALYSIS ===
 - URL: {website.get('url', 'N/A')}
 - Accessible: {website.get('accessible', False)}
-- Domain: {website.get('domain', 'N/A')}
 - Domain Age (years): {website.get('domain_age_years', 'Unknown')}
-- Domain Created: {website.get('domain_creation_date', 'Unknown')}
 - Has Contact Info: {website.get('has_contact_info', False)}
 - Has Physical Address: {website.get('has_address', False)}
 - Has About Page: {website.get('has_about_page', False)}
-- Has Product Catalog: {website.get('has_product_catalog', False)}
 - Professional Domain: {website.get('has_professional_domain', False)}
 - Red Flags: {'; '.join(website.get('flags', [])) or 'None'}
 """
 
-    # ── Email Check ───────────────────────────────────────────────────────────
     email_section = ""
     email_check = web_data.get("email_check", {})
     if email_check:
@@ -141,7 +117,6 @@ Justdial:
 - Flags: {'; '.join(email_check.get('flags', [])) or 'None'}
 """
 
-    # ── Scam Databases ────────────────────────────────────────────────────────
     scam_section = ""
     scam = web_data.get("scam_check", {})
     if scam:
@@ -152,7 +127,6 @@ Justdial:
 - Flagged snippets: {'; '.join(scam.get('flagged_snippets', [])) or 'None'}
 """
 
-    # ── Build full prompt ─────────────────────────────────────────────────────
     prompt = f"""You are a supplier due diligence expert for small businesses in India.
 Analyze ALL the data below about a supplier and give a comprehensive trust verdict.
 
@@ -163,7 +137,6 @@ SUPPLIER QUERY: {query}
 {fraud_section}
 {marketplace_section}
 {mca_section}
-{zauba_section}
 {linkedin_section}
 {website_section}
 {email_section}
@@ -217,41 +190,48 @@ async def get_verdict(query: str, gst_data: dict, web_data: dict) -> dict:
     prompt = build_prompt(query, gst_data, web_data)
 
     try:
-        async with httpx.AsyncClient(timeout=300) as client:
-            resp = await client.post(OLLAMA_URL, json={
-                "model": MODEL,
-                "prompt": prompt,
-                "stream": False,
-            })
-
-            data = resp.json()
-            raw = data.get("response", "")
-
-            match = re.search(r'\{.*\}', raw, re.DOTALL)
-            if match:
-                parsed = json.loads(match.group())
-                # Ensure new fields exist even if model skips them
-                parsed.setdefault("red_flags", [])
-                parsed.setdefault("positive_signals", [])
-                return parsed
-            else:
-                return {
-                    "trust_score": 50,
-                    "verdict": "YELLOW",
-                    "summary": "Could not fully analyze this supplier. Try again.",
-                    "reasons": ["AI response was unclear", "Re-run the search"],
-                    "red_flags": [],
-                    "positive_signals": [],
-                    "recommendation": "Search manually before proceeding.",
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a supplier due diligence expert. Always respond with valid JSON only. No markdown, no explanation, just the JSON object."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
                 }
+            ],
+            temperature=0.3,
+            max_tokens=1000,
+        )
+
+        raw = response.choices[0].message.content.strip()
+
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            parsed = json.loads(match.group())
+            parsed.setdefault("red_flags", [])
+            parsed.setdefault("positive_signals", [])
+            return parsed
+        else:
+            return {
+                "trust_score": 50,
+                "verdict": "YELLOW",
+                "summary": "Could not fully analyze this supplier. Try again.",
+                "reasons": ["AI response was unclear", "Re-run the search"],
+                "red_flags": [],
+                "positive_signals": [],
+                "recommendation": "Search manually before proceeding.",
+            }
 
     except Exception as e:
         return {
             "trust_score": 0,
             "verdict": "RED",
             "summary": f"AI analysis failed: {str(e)}",
-            "reasons": ["Ollama may not be running", "Check if mistral model is pulled"],
+            "reasons": ["Groq API error", "Check GROQ_API_KEY environment variable"],
             "red_flags": ["AI backend unreachable"],
             "positive_signals": [],
-            "recommendation": "Run: ollama serve, then restart backend.",
+            "recommendation": "Check Groq API key in Render environment variables.",
         }

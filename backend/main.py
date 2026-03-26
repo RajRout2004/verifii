@@ -20,6 +20,8 @@ app.add_middleware(
         "http://localhost:3000",
         "http://127.0.0.1:5173",
         "http://127.0.0.1:3000",
+        "https://verifii-two.vercel.app",
+        "https://*.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -31,9 +33,9 @@ init_db()
 
 class VerifyRequest(BaseModel):
     query: str
-    website: Optional[str] = None   # supplier website URL
-    email: Optional[str] = None     # supplier contact email
-    gstin: Optional[str] = None     # explicit GSTIN if user knows it
+    website: Optional[str] = None
+    email: Optional[str] = None
+    gstin: Optional[str] = None
 
 
 @app.post("/verify")
@@ -45,13 +47,11 @@ async def verify_supplier(req: VerifyRequest):
     gst_data = {}
     web_data = {}
 
-    # Determine GSTIN — from explicit field or detect in query
     gstin_to_check = req.gstin or query
     is_gstin = len(gstin_to_check) == 15 and gstin_to_check[:2].isdigit()
 
     if is_gstin:
         gst_data = await lookup_gstin(gstin_to_check)
-        # Also run web research using the legal name if we got it
         name_for_web = gst_data.get("legal_name") or gst_data.get("trade_name")
         if name_for_web and name_for_web != "N/A" and name_for_web != "Could not fetch from registry":
             web_data = await scrape_supplier(name_for_web, req.website, req.email)
