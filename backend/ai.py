@@ -1,8 +1,10 @@
 import os
 import json
 import re
+from dotenv import load_dotenv
 from groq import Groq
 
+load_dotenv()
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 MODEL = "llama-3.3-70b-versatile"
 
