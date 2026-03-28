@@ -4,7 +4,7 @@ import SearchBar from './components/searchbar'
 import ResultCard from './components/resultcard'
 import History from './components/history'
 
-const API = 'http://locahttps://verifii-backend.onrender.com/verifylhost:8000'
+const API = 'http://verifii-backend.onrender.com/verifylhost:8000'
 
 function App() {
   const [activeTab, setActiveTab] = useState('search')
@@ -126,7 +126,7 @@ function App() {
       {/* ── Footer ── */}
       <footer className="border-t border-slate-800 py-4">
         <p className="text-center text-slate-600 text-xs">
-          Verifii · Open Source · Powered by Mistral 7B via Ollama
+          Verifii · Open Source · Powered by Groq
         </p>
       </footer>
     </div>
