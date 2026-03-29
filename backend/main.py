@@ -70,6 +70,10 @@ async def verify_supplier(req: VerifyRequest):
         "verdict": verdict,
     }
 
+@app.post("/debug")
+async def debug(req: VerifyRequest):
+    web_data = await scrape_supplier(req.query)
+    return web_data
 
 @app.get("/history")
 def history():
