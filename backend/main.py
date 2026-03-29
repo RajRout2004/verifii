@@ -75,6 +75,23 @@ async def debug(req: VerifyRequest):
     web_data = await scrape_supplier(req.query)
     return web_data
 
+@app.get("/nettest")
+async def nettest():
+    import httpx
+    results = {}
+    urls = [
+        ("google", "https://www.google.com"),
+        ("scraperapi", "http://api.scraperapi.com?api_key=" + os.environ.get("SCRAPER_API_KEY", "") + "&url=https://www.indiamart.com"),
+    ]
+    async with httpx.AsyncClient(timeout=10) as client:
+        for name, url in urls:
+            try:
+                resp = await client.get(url)
+                results[name] = {"status": resp.status_code, "length": len(resp.text)}
+            except Exception as e:
+                results[name] = {"error": str(e)}
+    return results    
+
 @app.get("/history")
 def history():
     return get_history()
