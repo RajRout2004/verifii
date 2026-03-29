@@ -1,15 +1,19 @@
 """
 Verifii Scraper — Multi-source supplier research
-Covers: Google (reviews/fraud/complaints), IndiaMART, TradeIndia,
-        Justdial, MCA Portal, Zauba Corp, WHOIS domain age,
-        email domain check, LinkedIn presence, social media presence,
-        scam/blacklist search
+Uses ScraperAPI for Indian sites that geo-block non-Indian IPs.
+Uses direct requests for Google (works fine from Render).
 """
 import asyncio
+import os
 import re
 import httpx
 from bs4 import BeautifulSoup
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
+
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
 
 HEADERS = {
     "User-Agent": (
@@ -22,13 +26,18 @@ HEADERS = {
 }
 
 
+def scraper_url(target_url: str, country: str = "in") -> str:
+    """Wrap a URL through ScraperAPI with Indian IP."""
+    return (
+        f"http://api.scraperapi.com"
+        f"?api_key={SCRAPER_API_KEY}"
+        f"&url={target_url}"
+        f"&country_code={country}"
+        f"&render=false"
+    )
+
+
 async def scrape_supplier(query: str, website_url: str = None, email: str = None) -> dict:
-    """
-    Run all research tasks in parallel and return aggregated results.
-    query     = company name or business name
-    website_url = optional, if user provides their site
-    email     = optional, if user provides contact email
-    """
     tasks = [
         _google_reviews(query),
         _google_fraud(query),
@@ -69,16 +78,14 @@ async def scrape_supplier(query: str, website_url: str = None, email: str = None
     return results
 
 
-# ── 1. GOOGLE — REVIEWS ──────────────────────────────────────────────────────
+# ── GOOGLE (direct — works fine from Render) ─────────────────────────────────
+
 async def _google_reviews(query: str) -> dict:
-    q = f"{query} reviews India supplier"
-    return await _google_search(q, "Google Reviews")
+    return await _google_search(f"{query} reviews India supplier", "Google Reviews")
 
 
-# ── 2. GOOGLE — FRAUD SIGNALS ────────────────────────────────────────────────
 async def _google_fraud(query: str) -> dict:
-    q = f"{query} fraud scam fake"
-    data = await _google_search(q, "Google Fraud Check")
+    data = await _google_search(f"{query} fraud scam fake", "Google Fraud Check")
     fraud_keywords = ["fraud", "scam", "fake", "cheated", "complaint", "loss", "beware", "warning"]
     snippets = data.get("snippets", [])
     flags = [s for s in snippets if any(kw in s.lower() for kw in fraud_keywords)]
@@ -87,10 +94,8 @@ async def _google_fraud(query: str) -> dict:
     return data
 
 
-# ── 3. GOOGLE — COMPLAINTS ───────────────────────────────────────────────────
 async def _google_complaints(query: str) -> dict:
-    q = f"{query} complaint consumer forum India"
-    data = await _google_search(q, "Google Complaints")
+    data = await _google_search(f"{query} complaint consumer forum India", "Google Complaints")
     complaint_keywords = ["complaint", "issue", "problem", "refund", "cheated", "not delivered", "poor quality"]
     snippets = data.get("snippets", [])
     flags = [s for s in snippets if any(kw in s.lower() for kw in complaint_keywords)]
@@ -102,7 +107,7 @@ async def _google_complaints(query: str) -> dict:
 async def _google_search(query: str, source_name: str) -> dict:
     url = f"https://www.google.com/search?q={query.replace(' ', '+')}&num=10"
     try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=12, follow_redirects=True) as client:
+        async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as client:
             resp = await client.get(url)
             soup = BeautifulSoup(resp.text, "html.parser")
             snippets = []
@@ -122,16 +127,18 @@ async def _google_search(query: str, source_name: str) -> dict:
         return {"source": source_name, "snippets": [], "error": str(e)}
 
 
-# ── 4. INDIAMART ─────────────────────────────────────────────────────────────
+# ── INDIAMART (via ScraperAPI — Indian IP) ────────────────────────────────────
+
 async def _indiamart(query: str) -> dict:
-    url = f"https://dir.indiamart.com/search.mp?ss={query.replace(' ', '+')}"
+    target = f"https://dir.indiamart.com/search.mp?ss={query.replace(' ', '+')}"
+    url = scraper_url(target)
     try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=12, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             resp = await client.get(url)
             soup = BeautifulSoup(resp.text, "html.parser")
 
             companies = []
-            for card in soup.select(".companyname, .company-name, .bname, .ib-heading")[:5]:
+            for card in soup.select(".companyname, .company-name, .bname, .ib-heading, h2.name")[:5]:
                 name = card.get_text(strip=True)
                 if name:
                     companies.append(name)
@@ -158,11 +165,13 @@ async def _indiamart(query: str) -> dict:
         return {"source": "IndiaMART", "error": str(e), "found": False}
 
 
-# ── 5. TRADEINDIA ─────────────────────────────────────────────────────────────
+# ── TRADEINDIA (via ScraperAPI) ───────────────────────────────────────────────
+
 async def _tradeindia(query: str) -> dict:
-    url = f"https://www.tradeindia.com/search/?q={query.replace(' ', '+')}"
+    target = f"https://www.tradeindia.com/search/?q={query.replace(' ', '+')}"
+    url = scraper_url(target)
     try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=12, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             resp = await client.get(url)
             soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -184,11 +193,13 @@ async def _tradeindia(query: str) -> dict:
         return {"source": "TradeIndia", "error": str(e), "found": False}
 
 
-# ── 6. JUSTDIAL ───────────────────────────────────────────────────────────────
+# ── JUSTDIAL (via ScraperAPI) ─────────────────────────────────────────────────
+
 async def _justdial(query: str) -> dict:
-    url = f"https://www.justdial.com/search?q={query.replace(' ', '+')}&nc=cat"
+    target = f"https://www.justdial.com/search?q={query.replace(' ', '+')}&nc=cat"
+    url = scraper_url(target)
     try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=12, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             resp = await client.get(url)
             soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -212,42 +223,18 @@ async def _justdial(query: str) -> dict:
         return {"source": "Justdial", "error": str(e), "found": False}
 
 
-# ── 7. MCA PORTAL (Ministry of Corporate Affairs) ────────────────────────────
-async def _mca_portal(query: str) -> dict:
-    url = f"https://www.mca.gov.in/mcafoportal/showCheckCompanyName.do"
-    search_url = f"https://efiling.mca.gov.in/efs-filing/rest/getCompanyINC/getCompanyDetails?companyName={query.replace(' ', '%20')}"
-    try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=12, follow_redirects=True) as client:
-            resp = await client.get(search_url)
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    companies = data if isinstance(data, list) else [data]
-                    results = []
-                    for c in companies[:3]:
-                        results.append({
-                            "name": c.get("companyName", "N/A"),
-                            "cin": c.get("cin", "N/A"),
-                            "status": c.get("companyStatus", "N/A"),
-                            "incorporation_date": c.get("dateOfIncorporation", "N/A"),
-                            "type": c.get("companyType", "N/A"),
-                            "state": c.get("registeredState", "N/A"),
-                        })
-                    return {
-                        "source": "MCA Portal",
-                        "companies": results,
-                        "found": len(results) > 0,
-                    }
-                except Exception:
-                    pass
+# ── MCA PORTAL (via ScraperAPI) ──────────────────────────────────────────────
 
-        # Fallback: scrape public MCA search
-        fallback_url = f"https://www.mca.gov.in/mcafoportal/viewCompanyMasterData.do?companyName={query.replace(' ', '+')}"
-        async with httpx.AsyncClient(headers=HEADERS, timeout=12, follow_redirects=True) as client:
-            resp = await client.get(fallback_url)
+async def _mca_portal(query: str) -> dict:
+    target = f"https://www.mca.gov.in/mcafoportal/viewCompanyMasterData.do?companyName={query.replace(' ', '+')}"
+    url = scraper_url(target)
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            resp = await client.get(url)
             soup = BeautifulSoup(resp.text, "html.parser")
-            rows = soup.select("table tr")
+
             company_data = {}
+            rows = soup.select("table tr")
             for row in rows:
                 cells = row.find_all("td")
                 if len(cells) >= 2:
@@ -261,6 +248,31 @@ async def _mca_portal(query: str) -> dict:
                         company_data["incorporation_date"] = value
                     elif "type" in label:
                         company_data["type"] = value
+                    elif "cin" in label:
+                        company_data["cin"] = value
+
+            # Try MCA API endpoint
+            if not company_data:
+                api_target = f"https://efiling.mca.gov.in/efs-filing/rest/getCompanyINC/getCompanyDetails?companyName={query.replace(' ', '%20')}"
+                api_url = scraper_url(api_target)
+                resp2 = await client.get(api_url)
+                try:
+                    data = resp2.json()
+                    companies = data if isinstance(data, list) else [data]
+                    results = []
+                    for c in companies[:3]:
+                        results.append({
+                            "name": c.get("companyName", "N/A"),
+                            "cin": c.get("cin", "N/A"),
+                            "status": c.get("companyStatus", "N/A"),
+                            "incorporation_date": c.get("dateOfIncorporation", "N/A"),
+                            "type": c.get("companyType", "N/A"),
+                            "state": c.get("registeredState", "N/A"),
+                        })
+                    if results:
+                        return {"source": "MCA Portal", "companies": results, "found": True}
+                except Exception:
+                    pass
 
             return {
                 "source": "MCA Portal",
@@ -271,11 +283,13 @@ async def _mca_portal(query: str) -> dict:
         return {"source": "MCA Portal", "error": str(e), "found": False}
 
 
-# ── 8. ZAUBA CORP (Import/Export Data) ───────────────────────────────────────
+# ── ZAUBA CORP (via ScraperAPI) ───────────────────────────────────────────────
+
 async def _zauba_corp(query: str) -> dict:
-    url = f"https://www.zaubacorp.com/company-search/{query.replace(' ', '-').upper()}"
+    target = f"https://www.zaubacorp.com/company-search/{query.replace(' ', '-').upper()}"
+    url = scraper_url(target)
     try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=12, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             resp = await client.get(url)
             soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -299,11 +313,12 @@ async def _zauba_corp(query: str) -> dict:
         return {"source": "Zauba Corp", "error": str(e), "found": False}
 
 
-# ── 9. LINKEDIN PRESENCE ─────────────────────────────────────────────────────
+# ── LINKEDIN (via Google — no ScraperAPI needed) ──────────────────────────────
+
 async def _linkedin_presence(query: str) -> dict:
     search_url = f"https://www.google.com/search?q=site:linkedin.com+{query.replace(' ', '+')}+company+India"
     try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=12, follow_redirects=True) as client:
+        async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as client:
             resp = await client.get(search_url)
             soup = BeautifulSoup(resp.text, "html.parser")
 
@@ -328,7 +343,8 @@ async def _linkedin_presence(query: str) -> dict:
         return {"source": "LinkedIn", "profile_found": False, "error": str(e)}
 
 
-# ── 10. SCAM / BLACKLIST DATABASES ───────────────────────────────────────────
+# ── SCAM DATABASES (via Google — works fine) ──────────────────────────────────
+
 async def _scam_databases(query: str) -> dict:
     queries = [
         f"{query} scam India",
@@ -340,7 +356,7 @@ async def _scam_databases(query: str) -> dict:
     fraud_keywords = ["scam", "fraud", "fake", "cheat", "complaint", "beware",
                       "warning", "not genuine", "money lost", "not delivered"]
     try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=12, follow_redirects=True) as client:
+        async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as client:
             for q in queries:
                 url = f"https://www.google.com/search?q={q.replace(' ', '+')}&num=5"
                 resp = await client.get(url)
@@ -363,14 +379,15 @@ async def _scam_databases(query: str) -> dict:
         return {"source": "Scam/Blacklist Check", "error": str(e), "risk_level": "UNKNOWN"}
 
 
-# ── 11. WEBSITE ANALYSIS (if URL provided) ───────────────────────────────────
-async def _website_analysis(url: str) -> dict:
-    if not url.startswith("http"):
-        url = "https://" + url
+# ── WEBSITE ANALYSIS (via ScraperAPI) ────────────────────────────────────────
+
+async def _website_analysis(target_url: str) -> dict:
+    if not target_url.startswith("http"):
+        target_url = "https://" + target_url
 
     result = {
         "source": "Website Analysis",
-        "url": url,
+        "url": target_url,
         "accessible": False,
         "has_contact_info": False,
         "has_address": False,
@@ -380,14 +397,14 @@ async def _website_analysis(url: str) -> dict:
     }
 
     try:
-        domain = url.split("//")[-1].split("/")[0].replace("www.", "")
+        domain = target_url.split("//")[-1].split("/")[0].replace("www.", "")
         result["domain"] = domain
 
-        # Check if it's a professional domain (not gmail/yahoo/etc)
         free_domains = ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "rediffmail.com"]
         result["has_professional_domain"] = domain not in free_domains
 
-        async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as client:
+        url = scraper_url(target_url)
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             resp = await client.get(url)
             result["accessible"] = resp.status_code == 200
             result["status_code"] = resp.status_code
@@ -395,13 +412,11 @@ async def _website_analysis(url: str) -> dict:
             soup = BeautifulSoup(resp.text, "html.parser")
             text = soup.get_text(separator=" ", strip=True).lower()
 
-            # Check for contact/address signals
             result["has_contact_info"] = any(kw in text for kw in ["contact", "phone", "email", "call us"])
             result["has_address"] = any(kw in text for kw in ["address", "location", "office", "headquarter"])
             result["has_about_page"] = any(kw in text for kw in ["about us", "our company", "who we are"])
             result["has_product_catalog"] = any(kw in text for kw in ["product", "catalogue", "catalog", "price list"])
 
-            # Red flags
             if not result["has_contact_info"]:
                 result["flags"].append("No contact information found on website")
             if not result["has_address"]:
@@ -409,7 +424,7 @@ async def _website_analysis(url: str) -> dict:
             if not result["has_about_page"]:
                 result["flags"].append("No 'About Us' page found")
 
-        # WHOIS domain age via free API
+        # WHOIS domain age
         try:
             whois_url = f"https://api.whois.vu/?q={domain}&format=json"
             async with httpx.AsyncClient(timeout=8) as client:
@@ -438,7 +453,8 @@ async def _website_analysis(url: str) -> dict:
     return result
 
 
-# ── 12. EMAIL DOMAIN CHECK ────────────────────────────────────────────────────
+# ── EMAIL DOMAIN CHECK ────────────────────────────────────────────────────────
+
 async def _email_domain_check(email: str) -> dict:
     free_providers = [
         "gmail.com", "yahoo.com", "yahoo.in", "hotmail.com",
