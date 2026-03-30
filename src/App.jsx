@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import axios from 'axios'
-import searchbar from './components/searchbar'
+import SearchBar from './components/searchbar'
 import ResultCard from './components/resultcard'
 import History from './components/history'
 
@@ -89,7 +89,7 @@ function App() {
         {/* Tab Content */}
         {activeTab === 'search' && (
           <div>
-            <searchbar onSearch={handleSearch} loading={loading} />
+            <SearchBar onSearch={handleSearch} loading={loading} />
 
             {/* Loading State */}
             {loading && (
