@@ -1,12 +1,14 @@
 import { useEffect, useState } from 'react'
 import axios from 'axios'
 
+const API = import.meta.env.VITE_API_URL || 'https://verifii-backend.onrender.com'
+
 export default function History() {
   const [history, setHistory] = useState([])
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    axios.get('https://verifii-backend.onrender.com/history')
+    axios.get(`${API}/history`)
       .then(res => setHistory(res.data))
       .catch(() => setHistory([]))
       .finally(() => setLoading(false))

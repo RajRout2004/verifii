@@ -1,8 +1,7 @@
 """
-Verifii Scraper — Robust multi-source supplier research
-Uses text-based extraction instead of fragile CSS selectors.
-ScraperAPI routes Indian sites through Indian IPs.
-Google works directly from Render.
+Verifii Scraper v3 — Robust multi-source supplier research
+Fixes: MCA correct URL, LinkedIn via ScraperAPI, Zauba correct URL,
+       cleaner B2B marketplace text extraction, Google via ScraperAPI
 """
 import asyncio
 import os
@@ -26,36 +25,57 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+# Navigation/UI noise to filter out
+NOISE_PHRASES = [
+    "sign in", "join free", "post buy", "skip to", "search the",
+    "noresults", "no results", "cookie", "privacy policy", "terms",
+    "download app", "free listing", "advertise", "login", "register",
+    "select language", "we are hiring", "investor relations",
+    "home page", "homepage", "page not found", "error page",
+    "follow us", "contact us", "about us", "sitemap",
+    "all rights reserved", "copyright", "powered by",
+]
 
-def scraper_url(target_url: str, country: str = "in") -> str:
+
+def scraper_url(target_url: str, country: str = "in", render: bool = False) -> str:
+    render_str = "true" if render else "false"
     return (
         f"http://api.scraperapi.com"
         f"?api_key={SCRAPER_API_KEY}"
         f"&url={target_url}"
         f"&country_code={country}"
-        f"&render=false"
+        f"&render={render_str}"
     )
 
 
-def extract_text_blocks(html: str, min_len: int = 20) -> list:
-    """Extract all meaningful text blocks from HTML."""
+def is_noise(text: str) -> bool:
+    text_lower = text.lower()
+    return any(phrase in text_lower for phrase in NOISE_PHRASES)
+
+
+def clean_blocks(html: str, min_len: int = 15, max_len: int = 300) -> list:
+    """Extract clean, meaningful text blocks — filter out navigation noise."""
     soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "head"]):
+    for tag in soup(["script", "style", "nav", "footer", "head", "meta", "noscript"]):
         tag.decompose()
+    seen = set()
     blocks = []
-    for tag in soup.find_all(["p", "h1", "h2", "h3", "h4", "li", "span", "div", "td", "a"]):
+    for tag in soup.find_all(["p", "h1", "h2", "h3", "h4", "li", "td", "span", "div", "a"]):
         text = tag.get_text(separator=" ", strip=True)
-        if len(text) >= min_len and text not in blocks:
+        text = re.sub(r'\s+', ' ', text)
+        if (min_len <= len(text) <= max_len
+                and text not in seen
+                and not is_noise(text)):
+            seen.add(text)
             blocks.append(text)
-    return blocks[:50]
+    return blocks[:60]
 
 
-def company_mentioned(text_blocks: list, query: str) -> bool:
-    """Check if any variation of the company name appears in text."""
+def company_mentioned(blocks: list, query: str) -> bool:
     query_words = [w.lower() for w in query.split() if len(w) > 2]
-    for block in text_blocks:
+    for block in blocks:
         block_lower = block.lower()
-        if any(word in block_lower for word in query_words):
+        if sum(1 for w in query_words if w in block_lower) >= min(2, len(query_words)):
             return True
     return False
 
@@ -73,7 +93,6 @@ async def scrape_supplier(query: str, website_url: str = None, email: str = None
         _linkedin_presence(query),
         _scam_databases(query),
     ]
-
     if website_url:
         tasks.append(_website_analysis(website_url))
     if email:
@@ -93,25 +112,21 @@ async def scrape_supplier(query: str, website_url: str = None, email: str = None
 
     results = {}
     for key, val in zip(keys, results_list):
-        if isinstance(val, Exception):
-            results[key] = {"error": str(val), "source": key}
-        else:
-            results[key] = val
-
+        results[key] = {"error": str(val), "source": key} if isinstance(val, Exception) else val
     return results
 
 
-# ── GOOGLE (direct) ───────────────────────────────────────────────────────────
+# ── GOOGLE (via ScraperAPI to avoid bot detection) ────────────────────────────
 
 async def _google_reviews(query: str) -> dict:
-    return await _google_search(f"{query} reviews India supplier", "Google Reviews")
+    return await _google_search(f"{query} supplier India reviews site:indiamart.com OR site:tradeindia.com OR site:justdial.com", "Google Reviews")
 
 
 async def _google_fraud(query: str) -> dict:
     data = await _google_search(f"{query} fraud scam fake complaints India", "Google Fraud Check")
-    fraud_keywords = ["fraud", "scam", "fake", "cheated", "complaint", "loss", "beware", "warning", "cheat"]
+    fraud_kw = ["fraud", "scam", "fake", "cheated", "complaint", "loss", "beware", "warning", "cheat", "duped"]
     snippets = data.get("snippets", [])
-    flags = [s for s in snippets if any(kw in s.lower() for kw in fraud_keywords)]
+    flags = [s for s in snippets if any(kw in s.lower() for kw in fraud_kw)]
     data["fraud_mentions"] = len(flags)
     data["fraud_snippets"] = flags[:3]
     return data
@@ -119,37 +134,35 @@ async def _google_fraud(query: str) -> dict:
 
 async def _google_complaints(query: str) -> dict:
     data = await _google_search(f"{query} complaint consumer forum India", "Google Complaints")
-    complaint_keywords = ["complaint", "issue", "problem", "refund", "cheated", "not delivered", "poor quality"]
+    complaint_kw = ["complaint", "issue", "problem", "refund", "cheated", "not delivered", "poor quality"]
     snippets = data.get("snippets", [])
-    flags = [s for s in snippets if any(kw in s.lower() for kw in complaint_keywords)]
+    flags = [s for s in snippets if any(kw in s.lower() for kw in complaint_kw)]
     data["complaint_count"] = len(flags)
     data["complaint_snippets"] = flags[:3]
     return data
 
 
 async def _google_search(query: str, source_name: str) -> dict:
-    url = f"https://www.google.com/search?q={query.replace(' ', '+')}&num=10&hl=en"
+    target = f"https://www.google.com/search?q={query.replace(' ', '+')}&num=10&hl=en&gl=in"
+    url = scraper_url(target, country="in")
     try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             resp = await client.get(url)
             soup = BeautifulSoup(resp.text, "html.parser")
             snippets = []
             for tag in soup.find_all(["div", "span", "p"]):
                 text = tag.get_text(separator=" ", strip=True)
-                if 40 < len(text) < 500 and text not in snippets:
+                text = re.sub(r'\s+', ' ', text)
+                if 40 < len(text) < 400 and not is_noise(text) and text not in snippets:
                     snippets.append(text)
             links = []
             for a in soup.select("a[href]"):
                 href = a.get("href", "")
-                if href.startswith("/url?q="):
+                if "/url?q=" in href:
                     real = href.split("/url?q=")[1].split("&")[0]
                     if real.startswith("http") and "google" not in real:
                         links.append(real)
-            return {
-                "source": source_name,
-                "snippets": snippets[:8],
-                "links": links[:5],
-            }
+            return {"source": source_name, "snippets": snippets[:8], "links": links[:5]}
     except Exception as e:
         return {"source": source_name, "snippets": [], "error": str(e)}
 
@@ -161,26 +174,26 @@ async def _indiamart(query: str) -> dict:
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             resp = await client.get(scraper_url(target))
-            blocks = extract_text_blocks(resp.text)
+            blocks = clean_blocks(resp.text)
             found = company_mentioned(blocks, query)
 
-            # Look for rating patterns like "4.5", "★", "reviews"
-            ratings = [b for b in blocks if any(x in b.lower() for x in ["★", "rating", "review", "stars"]) and len(b) < 100]
-            # Look for year patterns
-            years = [b for b in blocks if re.search(r'(since|est\.?|established|year)\s*\d{4}', b.lower())]
-            # Look for verified patterns
-            verified = [b for b in blocks if any(x in b.lower() for x in ["verified", "trust", "gst verified"])]
-            # Extract company-like names (capitalized phrases)
-            companies = [b for b in blocks if b[0].isupper() and len(b) < 80 and len(b) > 5][:5]
+            ratings = [b for b in blocks if any(x in b for x in ["★", "/5", "Rated", "stars"]) and len(b) < 80]
+            years = [b for b in blocks if re.search(r'(since|est\.?|established)\s*\d{4}', b.lower())]
+            verified = [b for b in blocks if "verified" in b.lower() and len(b) < 60]
+            # Clean company names — must have query words, reasonable length
+            companies = [
+                b for b in blocks
+                if any(w.lower() in b.lower() for w in query.split() if len(w) > 2)
+                and len(b) < 100 and len(b) > 8
+            ][:5]
 
             return {
                 "source": "IndiaMART",
-                "companies_found": companies[:3],
+                "companies_found": companies,
                 "ratings": ratings[:3],
                 "years_listed": years[:2],
                 "verified_count": len(verified),
                 "found": found or len(companies) > 0,
-                "raw_blocks": blocks[:10],
             }
     except Exception as e:
         return {"source": "IndiaMART", "error": str(e), "found": False}
@@ -189,21 +202,24 @@ async def _indiamart(query: str) -> dict:
 # ── TRADEINDIA ────────────────────────────────────────────────────────────────
 
 async def _tradeindia(query: str) -> dict:
-    target = f"https://www.tradeindia.com/search/?q={query.replace(' ', '+')}"
+    target = f"https://www.tradeindia.com/search/?q={query.replace(' ', '+')}&cat=company"
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             resp = await client.get(scraper_url(target))
-            blocks = extract_text_blocks(resp.text)
+            blocks = clean_blocks(resp.text)
             found = company_mentioned(blocks, query)
-            verified = [b for b in blocks if "verified" in b.lower()]
-            companies = [b for b in blocks if b[0].isupper() and 5 < len(b) < 80][:5]
+            verified = [b for b in blocks if "verified" in b.lower() and len(b) < 60]
+            companies = [
+                b for b in blocks
+                if any(w.lower() in b.lower() for w in query.split() if len(w) > 2)
+                and len(b) < 100
+            ][:5]
 
             return {
                 "source": "TradeIndia",
-                "companies_found": companies[:3],
+                "companies_found": companies,
                 "verified_count": len(verified),
                 "found": found or len(companies) > 0,
-                "raw_blocks": blocks[:10],
             }
     except Exception as e:
         return {"source": "TradeIndia", "error": str(e), "found": False}
@@ -212,102 +228,150 @@ async def _tradeindia(query: str) -> dict:
 # ── JUSTDIAL ──────────────────────────────────────────────────────────────────
 
 async def _justdial(query: str) -> dict:
-    target = f"https://www.justdial.com/search?q={query.replace(' ', '+')}"
+    target = f"https://www.justdial.com/All-India/{query.replace(' ', '-')}/nct-10215168"
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
             resp = await client.get(scraper_url(target))
-            blocks = extract_text_blocks(resp.text)
+            blocks = clean_blocks(resp.text)
             found = company_mentioned(blocks, query)
-            ratings = [b for b in blocks if any(x in b for x in ["★", "Rated", "Rating", "/5"]) and len(b) < 100]
-            businesses = [b for b in blocks if b[0].isupper() and 5 < len(b) < 80][:5]
+            ratings = [b for b in blocks if any(x in b for x in ["★", "Rated", "/5", "Rating"]) and len(b) < 80]
+            businesses = [
+                b for b in blocks
+                if any(w.lower() in b.lower() for w in query.split() if len(w) > 2)
+                and len(b) < 100
+            ][:5]
 
             return {
                 "source": "Justdial",
-                "businesses_found": businesses[:3],
+                "businesses_found": businesses,
                 "ratings": ratings[:3],
                 "found": found or len(businesses) > 0,
-                "raw_blocks": blocks[:10],
             }
     except Exception as e:
         return {"source": "Justdial", "error": str(e), "found": False}
 
 
-# ── MCA PORTAL ────────────────────────────────────────────────────────────────
+# ── MCA PORTAL (correct URL) ──────────────────────────────────────────────────
 
 async def _mca_portal(query: str) -> dict:
-    target = f"https://www.mca.gov.in/mcafoportal/viewCompanyMasterData.do?companyName={query.replace(' ', '+')}"
+    # Use the correct MCA company name search page
+    target = f"https://www.mca.gov.in/mcafoportal/showCheckCompanyName.do"
+    search_target = f"https://efiling.mca.gov.in/efs-filing/rest/getCompanyINC/getCompanyDetails?companyName={query.replace(' ', '%20')}&companyType=&roc="
+
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            resp = await client.get(scraper_url(target))
-            blocks = extract_text_blocks(resp.text)
-            found = company_mentioned(blocks, query)
+            # Try the JSON API first
+            resp = await client.get(scraper_url(search_target))
+            try:
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    companies = []
+                    for c in data[:5]:
+                        name = c.get("companyName") or c.get("company_name", "")
+                        if name and any(w.lower() in name.lower() for w in query.split() if len(w) > 2):
+                            companies.append({
+                                "name": name,
+                                "cin": c.get("cin", "N/A"),
+                                "status": c.get("companyStatus", c.get("status", "N/A")),
+                                "incorporation_date": c.get("dateOfIncorporation", "N/A"),
+                                "type": c.get("companyType", "N/A"),
+                                "state": c.get("registeredState", "N/A"),
+                            })
+                    if companies:
+                        return {"source": "MCA Portal", "companies": companies, "found": True}
+            except Exception:
+                pass
 
-            # Look for CIN pattern (21 char alphanumeric)
-            cin_pattern = re.compile(r'[A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6}')
-            cin_matches = []
-            for block in blocks:
-                match = cin_pattern.search(block)
-                if match:
-                    cin_matches.append(match.group())
-
-            # Look for status keywords
-            status_blocks = [b for b in blocks if any(x in b.lower() for x in ["active", "strike off", "dissolved", "amalgamated"])]
-            # Look for date patterns
-            date_blocks = [b for b in blocks if re.search(r'\d{2}/\d{2}/\d{4}', b)]
-
-            company_data = {}
-            if found:
-                company_data = {
-                    "name": query,
-                    "cin": cin_matches[0] if cin_matches else "N/A",
-                    "status": status_blocks[0] if status_blocks else "Found on MCA",
-                    "incorporation_date": date_blocks[0] if date_blocks else "N/A",
-                    "type": "N/A",
-                    "state": "N/A",
-                }
-
-            return {
-                "source": "MCA Portal",
-                "companies": [company_data] if company_data else [],
-                "found": found or len(cin_matches) > 0,
-                "raw_blocks": blocks[:10],
-            }
-    except Exception as e:
-        return {"source": "MCA Portal", "error": str(e), "found": False}
-
-
-# ── ZAUBA CORP ────────────────────────────────────────────────────────────────
-
-async def _zauba_corp(query: str) -> dict:
-    target = f"https://www.zaubacorp.com/company-search/{query.replace(' ', '-').upper()}"
-    try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            resp = await client.get(scraper_url(target))
-            blocks = extract_text_blocks(resp.text)
+            # Fallback: scrape the MCA check company name page
+            mca_scrape = f"https://www.mca.gov.in/mcafoportal/showCheckCompanyName.do?companyName={query.replace(' ', '+')}"
+            resp2 = await client.get(scraper_url(mca_scrape))
+            blocks = clean_blocks(resp2.text)
             found = company_mentioned(blocks, query)
 
             cin_pattern = re.compile(r'[A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6}')
             companies = []
             for block in blocks:
-                if cin_pattern.search(block) or (query.split()[0].lower() in block.lower() and len(block) < 100):
-                    companies.append({"name": block[:80], "cin": "N/A", "status": "N/A", "incorporation": "N/A"})
+                cin_match = cin_pattern.search(block)
+                if cin_match and any(w.lower() in block.lower() for w in query.split() if len(w) > 2):
+                    companies.append({
+                        "name": query,
+                        "cin": cin_match.group(),
+                        "status": "Found on MCA",
+                        "incorporation_date": "N/A",
+                        "type": "N/A",
+                        "state": "N/A",
+                    })
+
+            # Also check Zauba which mirrors MCA data
+            zauba_target = f"https://www.zaubacorp.com/company-list/p-1/company-name-{query.replace(' ', '-').upper()}.html"
+            resp3 = await client.get(scraper_url(zauba_target))
+            blocks3 = clean_blocks(resp3.text)
+            cin_found = []
+            for block in blocks3:
+                cin_match = cin_pattern.search(block)
+                if cin_match:
+                    name_part = block.replace(cin_match.group(), "").strip()
+                    cin_found.append({
+                        "name": name_part[:80] or query,
+                        "cin": cin_match.group(),
+                        "status": "N/A",
+                        "incorporation_date": "N/A",
+                        "type": "N/A",
+                        "state": "N/A",
+                    })
+
+            all_companies = companies + cin_found
+            return {
+                "source": "MCA Portal",
+                "companies": all_companies[:5],
+                "found": found or len(all_companies) > 0,
+            }
+    except Exception as e:
+        return {"source": "MCA Portal", "error": str(e), "found": False}
+
+
+# ── ZAUBA CORP (fixed URL) ────────────────────────────────────────────────────
+
+async def _zauba_corp(query: str) -> dict:
+    # Correct Zauba search URL
+    target = f"https://www.zaubacorp.com/company-list/p-1/company-name-{query.replace(' ', '-').upper()}.html"
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            resp = await client.get(scraper_url(target))
+            blocks = clean_blocks(resp.text)
+            found = company_mentioned(blocks, query)
+
+            cin_pattern = re.compile(r'[A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6}')
+            companies = []
+            for block in blocks:
+                cin_match = cin_pattern.search(block)
+                if cin_match:
+                    name_part = re.sub(cin_pattern, '', block).strip()
+                    if any(w.lower() in name_part.lower() for w in query.split() if len(w) > 2):
+                        companies.append({
+                            "name": name_part[:80] or query,
+                            "cin": cin_match.group(),
+                            "status": "N/A",
+                            "incorporation": "N/A",
+                        })
 
             return {
                 "source": "Zauba Corp",
-                "companies": companies[:3],
+                "companies": companies[:5],
                 "found": found or len(companies) > 0,
             }
     except Exception as e:
         return {"source": "Zauba Corp", "error": str(e), "found": False}
 
 
-# ── LINKEDIN (via Google) ─────────────────────────────────────────────────────
+# ── LINKEDIN (via ScraperAPI Google search) ───────────────────────────────────
 
 async def _linkedin_presence(query: str) -> dict:
-    search_url = f"https://www.google.com/search?q=site:linkedin.com+%22{query.replace(' ', '+')}%22+India"
+    target = f"https://www.google.com/search?q=%22{query.replace(' ', '+')}%22+site:linkedin.com/company&gl=in"
+    url = scraper_url(target, country="in")
     try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as client:
-            resp = await client.get(search_url)
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            resp = await client.get(url)
             soup = BeautifulSoup(resp.text, "html.parser")
 
             linkedin_links = []
@@ -315,23 +379,18 @@ async def _linkedin_presence(query: str) -> dict:
                 href = a.get("href", "")
                 if "/url?q=" in href:
                     real = href.split("/url?q=")[1].split("&")[0]
-                    if "linkedin.com" in real:
+                    if "linkedin.com/company" in real:
                         linkedin_links.append(real)
 
             snippets = []
             for tag in soup.find_all(["div", "span"]):
                 text = tag.get_text(separator=" ", strip=True)
-                if "linkedin" in text.lower() and 20 < len(text) < 300:
+                if "linkedin" in text.lower() and 20 < len(text) < 300 and not is_noise(text):
                     snippets.append(text)
-
-            # Also check if query words appear in any result
-            all_text = soup.get_text().lower()
-            query_words = [w.lower() for w in query.split() if len(w) > 2]
-            name_found = any(word in all_text for word in query_words)
 
             return {
                 "source": "LinkedIn",
-                "profile_found": len(linkedin_links) > 0 or name_found,
+                "profile_found": len(linkedin_links) > 0,
                 "links": linkedin_links[:3],
                 "snippets": snippets[:3],
             }
@@ -345,23 +404,23 @@ async def _scam_databases(query: str) -> dict:
     queries = [
         f"{query} scam India",
         f"{query} fraud complaint India",
-        f"{query} cheated supplier",
+        f"{query} cheated supplier review",
     ]
     all_snippets = []
     all_flags = []
-    fraud_keywords = ["scam", "fraud", "fake", "cheat", "complaint", "beware",
-                      "warning", "not genuine", "money lost", "not delivered"]
+    fraud_kw = ["scam", "fraud", "fake", "cheat", "complaint", "beware",
+                "warning", "not genuine", "money lost", "not delivered", "duped"]
     try:
-        async with httpx.AsyncClient(headers=HEADERS, timeout=15, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
             for q in queries:
-                url = f"https://www.google.com/search?q={q.replace(' ', '+')}&num=5"
-                resp = await client.get(url)
+                target = f"https://www.google.com/search?q={q.replace(' ', '+')}&num=5&gl=in"
+                resp = await client.get(scraper_url(target, country="in"))
                 soup = BeautifulSoup(resp.text, "html.parser")
                 for tag in soup.find_all(["div", "span", "p"]):
                     text = tag.get_text(separator=" ", strip=True)
-                    if len(text) > 30:
+                    if 30 < len(text) < 400 and not is_noise(text):
                         all_snippets.append(text)
-                        if any(kw in text.lower() for kw in fraud_keywords):
+                        if any(kw in text.lower() for kw in fraud_kw):
                             all_flags.append(text)
 
         return {
@@ -397,23 +456,21 @@ async def _website_analysis(target_url: str) -> dict:
         free_domains = ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "rediffmail.com"]
         result["has_professional_domain"] = domain not in free_domains
 
-        url = scraper_url(target_url)
         async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            resp = await client.get(url)
+            resp = await client.get(scraper_url(target_url))
             result["accessible"] = resp.status_code == 200
-            result["status_code"] = resp.status_code
-            blocks = extract_text_blocks(resp.text)
+            blocks = clean_blocks(resp.text)
             all_text = " ".join(blocks).lower()
 
             result["has_contact_info"] = any(kw in all_text for kw in ["contact", "phone", "email", "call us", "reach us"])
             result["has_address"] = any(kw in all_text for kw in ["address", "location", "office", "headquarter", "plot", "sector"])
-            result["has_about_page"] = any(kw in all_text for kw in ["about us", "our company", "who we are", "our story"])
+            result["has_about_page"] = any(kw in all_text for kw in ["about us", "our company", "who we are"])
             result["has_product_catalog"] = any(kw in all_text for kw in ["product", "catalogue", "catalog", "price list"])
 
             if not result["has_contact_info"]:
-                result["flags"].append("No contact information found on website")
+                result["flags"].append("No contact information found")
             if not result["has_address"]:
-                result["flags"].append("No physical address found on website")
+                result["flags"].append("No physical address found")
 
         # WHOIS domain age
         try:
@@ -428,7 +485,7 @@ async def _website_analysis(target_url: str) -> dict:
                         age_years = datetime.now().year - created_year
                         result["domain_age_years"] = age_years
                         if age_years < 1:
-                            result["flags"].append(f"Domain created very recently — high risk")
+                            result["flags"].append("Domain created very recently — high risk")
                         elif age_years < 2:
                             result["flags"].append(f"Domain only {age_years} year old — verify carefully")
                     except Exception:

@@ -7,11 +7,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from scraper import scrape_supplier
-from gst import lookup_gstin
+from gst import lookup_gstin, search_gstin_by_name
 from ai import get_verdict
 from database import init_db, save_result, get_history
 
-app = FastAPI(title="Verifii API", version="2.0.0")
+app = FastAPI(title="Verifii API", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,6 +38,10 @@ class VerifyRequest(BaseModel):
     gstin: Optional[str] = None
 
 
+class GSTINSearchRequest(BaseModel):
+    company_name: str
+
+
 @app.post("/verify")
 async def verify_supplier(req: VerifyRequest):
     query = req.query.strip()
@@ -53,7 +57,7 @@ async def verify_supplier(req: VerifyRequest):
     if is_gstin:
         gst_data = await lookup_gstin(gstin_to_check)
         name_for_web = gst_data.get("legal_name") or gst_data.get("trade_name")
-        if name_for_web and name_for_web != "N/A" and name_for_web != "Could not fetch from registry":
+        if name_for_web and name_for_web not in ["N/A", "Could not fetch from registry"]:
             web_data = await scrape_supplier(name_for_web, req.website, req.email)
         else:
             web_data = await scrape_supplier(query, req.website, req.email)
@@ -70,27 +74,15 @@ async def verify_supplier(req: VerifyRequest):
         "verdict": verdict,
     }
 
-@app.post("/debug")
-async def debug(req: VerifyRequest):
-    web_data = await scrape_supplier(req.query)
-    return web_data
 
-@app.get("/nettest")
-async def nettest():
-    import httpx
-    results = {}
-    urls = [
-        ("google", "https://www.google.com"),
-        ("scraperapi", "http://api.scraperapi.com?api_key=" + os.environ.get("SCRAPER_API_KEY", "") + "&url=https://www.indiamart.com"),
-    ]
-    async with httpx.AsyncClient(timeout=10) as client:
-        for name, url in urls:
-            try:
-                resp = await client.get(url)
-                results[name] = {"status": resp.status_code, "length": len(resp.text)}
-            except Exception as e:
-                results[name] = {"error": str(e)}
-    return results    
+@app.post("/gstin-search")
+async def gstin_search(req: GSTINSearchRequest):
+    """Search all GSTINs for a company name across all Indian states."""
+    if not req.company_name.strip():
+        raise HTTPException(status_code=400, detail="Company name cannot be empty")
+    result = await search_gstin_by_name(req.company_name.strip())
+    return result
+
 
 @app.get("/history")
 def history():
@@ -99,4 +91,29 @@ def history():
 
 @app.get("/")
 def root():
-    return {"status": "Verifii backend running", "version": "2.0.0"}
+    return {"status": "Verifii backend running", "version": "3.0.0"}
+
+
+# Debug endpoints — remove before final production
+@app.post("/debug")
+async def debug(req: VerifyRequest):
+    web_data = await scrape_supplier(req.query)
+    return web_data
+
+
+@app.get("/nettest")
+async def nettest():
+    import httpx
+    results = {}
+    urls = [
+        ("google", "https://www.google.com"),
+        ("scraperapi", f"http://api.scraperapi.com?api_key={os.environ.get('SCRAPER_API_KEY', '')}&url=https://www.indiamart.com"),
+    ]
+    async with httpx.AsyncClient(timeout=10) as client:
+        for name, url in urls:
+            try:
+                resp = await client.get(url)
+                results[name] = {"status": resp.status_code, "length": len(resp.text)}
+            except Exception as e:
+                results[name] = {"error": str(e)}
+    return results
