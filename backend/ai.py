@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from groq import Groq
 
 load_dotenv()
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+client = Groq(api_key=os.environ.get("GROQ_API_KEY"), timeout=20.0)
 MODEL = "llama-3.3-70b-versatile"
 
 
@@ -13,7 +13,23 @@ def build_prompt(query: str, gst_data: dict, web_data: dict) -> str:
 
     gst_section = ""
     if gst_data:
-        gst_section = f"""
+        if gst_data.get('search_type') == 'company_name':
+            # Company name search — show GSTIN discovery results
+            gstin_count = gst_data.get('gstin_count', 0)
+            gstins = gst_data.get('gstins_found', [])
+            gstin_list = "\n".join([
+                f"  - {g.get('gstin', 'N/A')} | {g.get('state', 'N/A')} | Status: {g.get('status', 'N/A')}"
+                for g in gstins[:8]
+            ]) if gstins else "  None found"
+            gst_section = f"""
+=== GST REGISTRY (Company Name Search) ===
+- Total GSTINs found: {gstin_count}
+- GSTINs registered in India:
+{gstin_list}
+Note: {gstin_count} GSTIN registrations found across Indian states. This indicates {'an active, registered business presence' if gstin_count > 0 else 'no GST registration was found — this is a concern for any legitimate business'}.
+"""
+        else:
+            gst_section = f"""
 === GST & TAX REGISTRATION ===
 - GSTIN Valid: {gst_data.get('valid')}
 - Legal Name: {gst_data.get('legal_name', 'N/A')}
@@ -144,22 +160,34 @@ SUPPLIER QUERY: {query}
 {email_section}
 {scam_section}
 
-SCORING GUIDE:
-- GST invalid or inactive → subtract 30 points immediately
-- Fraud/scam mentions → subtract 20 points per credible mention
-- No marketplace presence at all → subtract 10 points
-- No LinkedIn presence (for a company claiming to be large) → subtract 5 points
-- Domain created less than 1 year ago → subtract 15 points
-- Using Gmail/free email for B2B → subtract 10 points
-- MCA strike-off or not found (for Pvt Ltd/LLP) → subtract 20 points
-- Multiple complaint snippets → subtract 10-20 points
+CRITICAL CONTEXT — READ THIS FIRST:
+- You are assessing whether this company is a TRUSTWORTHY B2B SUPPLIER to buy from.
+- Consumer complaints (delivery issues, refund problems, app bugs, expired products) are COMPLETELY NORMAL for large consumer-facing companies like JioMart, Amazon, Flipkart, Swiggy, BigBasket, Tata, Reliance, Hindustan Unilever, etc.
+- Do NOT treat consumer complaints as B2B fraud signals. A company with millions of customers will naturally have complaints online.
+- "Scam" mentions on Google for well-known brands are almost always frustrated customers, NOT evidence of supplier fraud.
+- Well-known brands with marketplace presence, verified listings, or government registrations should score HIGH (70+).
+- Only consider GENUINE B2B fraud: fake companies, absconded directors, shell companies, money lost to supplier, advance payment scams, police cases.
 
-BONUS POINTS:
-- GST active + name matches → add 30 points
-- Found on IndiaMART/TradeIndia with verified badge → add 15 points
-- LinkedIn company page exists → add 10 points
-- Website professional with domain age 3+ years → add 15 points
-- MCA active with regular filings → add 20 points
+SCORING GUIDE (start from 50, adjust based on evidence):
+
+PENALTIES (apply ONCE each, NOT per mention):
+- GST invalid or inactive → -30 points
+- Genuine B2B fraud evidence (fake company, absconded, police case) → -25 points max total
+- No marketplace presence AND no web presence at all → -15 points
+- No LinkedIn presence (for companies claiming to be large) → -5 points
+- Domain created less than 1 year ago → -15 points
+- Using Gmail/free email for B2B → -10 points
+- MCA strike-off → -20 points
+- Consumer complaints only (delivery/refund/quality) → -5 points max (this is NORMAL)
+
+BONUSES:
+- GST active + name matches → +30 points
+- Found on IndiaMART/TradeIndia with verified badge → +15 points
+- LinkedIn company page exists → +10 points
+- Website professional with domain age 3+ years → +15 points
+- MCA active with regular filings → +20 points
+- Well-known established brand recognized across India → +20 points
+- Multiple marketplace listings or verified sellers → +10 points
 
 Respond ONLY with a valid JSON object in this exact format, nothing else:
 {{
@@ -178,9 +206,10 @@ Respond ONLY with a valid JSON object in this exact format, nothing else:
 }}
 
 Rules:
-- GREEN (70-100): Multiple strong signals, GST active, marketplace presence, no complaints
-- YELLOW (40-69): Some signals but gaps, verify before large orders
-- RED (0-39): Serious red flags, missing key registrations, fraud signals found
+- GREEN (70-100): Known brand OR multiple strong signals, marketplace presence, verified listings
+- YELLOW (40-69): Some signals but gaps, unknown company, verify before large orders
+- RED (0-39): Genuine B2B fraud evidence, fake/shell company, absconded directors, police cases
+- IMPORTANT: Large consumer brands should almost NEVER be RED. Consumer complaints alone do NOT justify RED.
 - Be specific — mention actual data found, not generic statements
 - Write as if explaining to a kirana store owner who has never used software
 - Do NOT include anything outside the JSON object

@@ -12,19 +12,26 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
-  async function handleSearch(query) {
+  async function handleSearch(query, companyName = '') {
     setLoading(true)
     setError('')
     setResult(null)
 
     try {
-      const res = await axios.post(`${API}/verify`, { query })
+      const payload = { query }
+      if (companyName) payload.company_name = companyName
+      const res = await axios.post(`${API}/verify`, payload, { timeout: 60000 })
       setResult(res.data)
     } catch (err) {
-      const msg =
-        err.response?.data?.detail ||
-        err.message ||
-        'Something went wrong. Is the backend running?'
+      let msg
+      if (err.code === 'ECONNABORTED' || err.message?.includes('timeout')) {
+        msg = 'Request timed out. The verification is taking too long — please try again.'
+      } else {
+        msg =
+          err.response?.data?.detail ||
+          err.message ||
+          'Something went wrong. Is the backend running?'
+      }
       setError(msg)
     } finally {
       setLoading(false)

@@ -22,7 +22,7 @@ export default function SearchBar({ onSearch, loading }) {
     setGstinLoading(true)
     setGstinResults(null)
     try {
-      const res = await axios.post(`${API}/gstin-search`, { company_name: query.trim() })
+      const res = await axios.post(`${API}/gstin-search`, { company_name: query.trim() }, { timeout: 35000 })
       setGstinResults(res.data)
     } catch (err) {
       setGstinResults({ error: 'Could not fetch GSTINs. Try again.' })
@@ -32,9 +32,19 @@ export default function SearchBar({ onSearch, loading }) {
   }
 
   function handleGstinClick(gstin) {
+    // Only pass company name if we successfully fetched the real legal/trade name for this specific GSTIN
+    const item = gstinResults?.gstins?.find(g => g.gstin === gstin)
+    let companyNameToPass = ''
+    if (item) {
+      if (item.legal_name && item.legal_name !== 'N/A' && item.legal_name !== 'Could not fetch from registry') {
+        companyNameToPass = item.legal_name
+      } else if (item.trade_name && item.trade_name !== 'N/A' && item.trade_name !== (gstinResults?.company_name || '').toUpperCase()) {
+        companyNameToPass = item.trade_name
+      }
+    }
     setQuery(gstin)
     setGstinResults(null)
-    onSearch(gstin)
+    onSearch(gstin, companyNameToPass)
   }
 
   return (
@@ -116,11 +126,10 @@ export default function SearchBar({ onSearch, loading }) {
                           )}
                         </div>
                         <div className="text-right shrink-0 ml-3">
-                          <span className={`text-xs px-2 py-0.5 rounded-full ${
-                            item.status?.toLowerCase().includes('active')
+                          <span className={`text-xs px-2 py-0.5 rounded-full ${item.status?.toLowerCase().includes('active')
                               ? 'bg-emerald-900/50 text-emerald-400'
                               : 'bg-slate-700 text-slate-400'
-                          }`}>
+                            }`}>
                             {item.status || 'Unknown'}
                           </span>
                           <p className="text-indigo-400 text-xs mt-1">Click to verify →</p>

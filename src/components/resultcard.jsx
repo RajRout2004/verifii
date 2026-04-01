@@ -30,17 +30,27 @@ export default function ResultCard({ result }) {
     )
   }
 
-  const SourceRow = ({ label, found, detail }) => (
-    <div className="flex items-center justify-between py-1.5 border-b border-slate-700/50 last:border-0">
-      <span className="text-slate-400 text-xs">{label}</span>
-      <div className="flex items-center gap-2">
-        {detail && <span className="text-slate-500 text-xs">{detail}</span>}
-        <span className={`text-xs font-medium ${found ? 'text-emerald-400' : 'text-red-400'}`}>
-          {found ? '✓ Found' : '✗ Not found'}
-        </span>
+  const SourceRow = ({ label, status, detail }) => {
+    const statusConfig = {
+      found:     { text: '✓ Found',     color: 'text-emerald-400' },
+      clean:     { text: '✓ Clean',     color: 'text-emerald-400' },
+      flagged:   { text: '⚠ Flagged',   color: 'text-yellow-400' },
+      not_found: { text: '✗ Not found', color: 'text-red-400' },
+      skipped:   { text: '— Not checked', color: 'text-slate-500' },
+    }
+    const cfg = statusConfig[status] || statusConfig.not_found
+    return (
+      <div className="flex items-center justify-between py-1.5 border-b border-slate-700/50 last:border-0">
+        <span className="text-slate-400 text-xs">{label}</span>
+        <div className="flex items-center gap-2">
+          {detail && <span className="text-slate-500 text-xs">{detail}</span>}
+          <span className={`text-xs font-medium ${cfg.color}`}>
+            {cfg.text}
+          </span>
+        </div>
       </div>
-    </div>
-  )
+    )
+  }
 
   const google_fraud      = web_data?.google_fraud || {}
   const google_complaints = web_data?.google_complaints || {}
@@ -53,6 +63,37 @@ export default function ResultCard({ result }) {
   const email_check       = web_data?.email_check || {}
   const scam_check        = web_data?.scam_check || {}
   const zauba             = web_data?.zauba || {}
+
+  // Determine if GST was actually checked
+  // For company name searches: gst_data has search_type='company_name' with gstin_count
+  // For GSTIN searches: gst_data has 'valid' field
+  const isCompanySearch = gst_data?.search_type === 'company_name'
+  const gstWasChecked = gst_data && Object.keys(gst_data).length > 0
+  let gstStatus, gstDetail
+  if (isCompanySearch) {
+    const count = gst_data?.gstin_count || 0
+    gstStatus = count > 0 ? 'found' : 'not_found'
+    gstDetail = count > 0 ? `${count} GSTIN${count > 1 ? 's' : ''} found` : null
+  } else if (gstWasChecked) {
+    gstStatus = gst_data?.valid ? 'found' : 'not_found'
+    gstDetail = gst_data?.status || null
+  } else {
+    gstStatus = 'skipped'
+    gstDetail = null
+  }
+
+  // Scam/fraud/complaint statuses — invert the logic so it makes sense
+  const scamStatus = !scam_check?.risk_level ? 'skipped'
+    : scam_check.risk_level === 'LOW' ? 'clean'
+    : 'flagged'
+  const fraudStatus = google_fraud?.fraud_mentions > 0 ? 'flagged' : 'clean'
+  const complaintStatus = google_complaints?.complaint_count > 0 ? 'flagged' : 'clean'
+
+  // Website status — handle discovered websites and explicitly provided websites
+  const websiteStatus = website?.not_discovered ? 'not_found'
+    : website?.url ? (website?.accessible ? 'found' : 'not_found')
+    : website?.accessible ? 'found'
+    : 'not_found'
 
   const scamRiskColor = { HIGH: 'red', MEDIUM: 'yellow', LOW: 'green', UNKNOWN: 'gray' }
 
@@ -133,17 +174,17 @@ export default function ResultCard({ result }) {
       {/* Research Coverage Overview */}
       <Section title="Research Coverage">
         <div className="space-y-0">
-          <SourceRow label="GST Registry"     found={gst_data?.valid}                          detail={gst_data?.status} />
-          <SourceRow label="MCA Portal"       found={mca?.found}                               detail={mca?.companies?.[0]?.status} />
-          <SourceRow label="IndiaMART"        found={indiamart?.found}                         detail={indiamart?.verified_count > 0 ? `${indiamart.verified_count} verified` : null} />
-          <SourceRow label="TradeIndia"       found={tradeindia?.found}                        detail={tradeindia?.verified_count > 0 ? `${tradeindia.verified_count} verified` : null} />
-          <SourceRow label="Justdial"         found={justdial?.found}                          detail={justdial?.ratings?.[0]} />
-          <SourceRow label="Zauba Corp"       found={zauba?.found} />
-          <SourceRow label="LinkedIn"         found={linkedin?.profile_found} />
-          <SourceRow label="Website"          found={website?.accessible}                      detail={website?.domain_age_years ? `${website.domain_age_years}yr domain` : null} />
-          <SourceRow label="Scam Databases"   found={scam_check?.risk_level === 'LOW'}         detail={scam_check?.risk_level ? `Risk: ${scam_check.risk_level}` : null} />
-          <SourceRow label="Fraud Search"     found={!google_fraud?.fraud_mentions}            detail={google_fraud?.fraud_mentions > 0 ? `${google_fraud.fraud_mentions} mentions` : 'Clean'} />
-          <SourceRow label="Complaint Search" found={!google_complaints?.complaint_count}      detail={google_complaints?.complaint_count > 0 ? `${google_complaints.complaint_count} found` : 'Clean'} />
+          <SourceRow label="GST Registry"     status={gstStatus}                                 detail={gstDetail} />
+          <SourceRow label="MCA Portal"       status={mca?.found ? 'found' : 'not_found'}        detail={mca?.companies?.[0]?.status} />
+          <SourceRow label="IndiaMART"        status={indiamart?.found ? 'found' : 'not_found'}  detail={indiamart?.verified_count > 0 ? `${indiamart.verified_count} verified` : null} />
+          <SourceRow label="TradeIndia"       status={tradeindia?.found ? 'found' : 'not_found'} detail={tradeindia?.verified_count > 0 ? `${tradeindia.verified_count} verified` : null} />
+          <SourceRow label="Justdial"         status={justdial?.found ? 'found' : 'not_found'}   detail={justdial?.ratings?.[0]} />
+          <SourceRow label="Zauba Corp"       status={zauba?.found ? 'found' : 'not_found'} />
+          <SourceRow label="LinkedIn"         status={linkedin?.profile_found ? 'found' : 'not_found'} />
+          <SourceRow label="Website"          status={websiteStatus}                              detail={website?.domain_age_years ? `${website.domain_age_years}yr domain` : null} />
+          <SourceRow label="Scam Databases"   status={scamStatus}                                 detail={scam_check?.risk_level ? `Risk: ${scam_check.risk_level}` : null} />
+          <SourceRow label="Fraud Search"     status={fraudStatus}                                detail={google_fraud?.fraud_mentions > 0 ? `${google_fraud.fraud_mentions} mentions` : null} />
+          <SourceRow label="Complaint Search" status={complaintStatus}                            detail={google_complaints?.complaint_count > 0 ? `${google_complaints.complaint_count} found` : null} />
         </div>
       </Section>
 
@@ -166,6 +207,35 @@ export default function ResultCard({ result }) {
               </div>
             ) : null)}
           </div>
+        </Section>
+      )}
+
+      {/* GSTIN Summary for company name searches */}
+      {isCompanySearch && gst_data?.gstin_count > 0 && (
+        <Section title="GSTIN Registry Data">
+          <p className="text-slate-400 text-xs mb-3">
+            Found {gst_data.gstin_count} GSTIN registration{gst_data.gstin_count > 1 ? 's' : ''} across India
+          </p>
+          <div className="space-y-2 max-h-48 overflow-y-auto">
+            {gst_data.gstins_found?.slice(0, 8).map((item, i) => (
+              <div key={i} className="flex items-center justify-between py-1.5 border-b border-slate-700/50 last:border-0">
+                <div>
+                  <p className="text-white text-xs font-mono">{item.gstin}</p>
+                  <p className="text-slate-500 text-xs">{item.state}</p>
+                </div>
+                <span className={`text-xs px-2 py-0.5 rounded-full ${
+                  item.status?.toLowerCase().includes('active')
+                    ? 'bg-emerald-900/50 text-emerald-400'
+                    : 'bg-slate-700 text-slate-400'
+                }`}>
+                  {item.status || 'Found'}
+                </span>
+              </div>
+            ))}
+          </div>
+          {gst_data.gstin_count > 8 && (
+            <p className="text-slate-500 text-xs mt-2">+ {gst_data.gstin_count - 8} more GSTINs found</p>
+          )}
         </Section>
       )}
 

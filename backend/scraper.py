@@ -1,13 +1,16 @@
 """
-Verifii Scraper v4 — Fixed multi-source supplier research
-Fixes: Google snippet noise filtering, updated link extraction,
-       fixed Justdial URL, improved IndiaMART extraction,
-       parallelized scam DB queries, LinkedIn timeout handling
+Verifii Scraper v6 — Optimized Google-first architecture
+- ALL source checks use Google Search via ScraperAPI
+- B2B marketplace checks (IndiaMART + TradeIndia + Justdial) combined into ONE search
+- Company registration checks (MCA + Zauba Corp) combined into ONE search
+- Total: 7 Google searches per verification (down from 12-18)
+- This avoids ScraperAPI rate-limiting which was causing most sources to fail
 """
 import asyncio
 import os
 import re
 import httpx
+from urllib.parse import quote_plus
 from bs4 import BeautifulSoup
 from datetime import datetime
 from dotenv import load_dotenv
@@ -15,6 +18,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
+
+# Limit ScraperAPI to 4 concurrent requests to prevent Free Tier 429/timeout errors
+scraper_semaphore = asyncio.Semaphore(4)
 
 HEADERS = {
     "User-Agent": (
@@ -26,7 +32,6 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# Navigation/UI noise to filter out
 NOISE_PHRASES = [
     "sign in", "join free", "post buy", "skip to", "search the",
     "noresults", "no results", "cookie", "privacy policy", "terms",
@@ -37,27 +42,22 @@ NOISE_PHRASES = [
     "all rights reserved", "copyright", "powered by",
 ]
 
-# Google UI noise that should never be counted as real content
 GOOGLE_UI_NOISE = [
     "press / to jump to the search box",
-    "ai mode all news",
-    "ai mode all",
+    "ai mode all news", "ai mode all",
     "an ai overview is not available",
     "can't generate an ai overview",
     "all news videos forums images",
     "all news images forums shopping",
-    "short videos more",
-    "images short videos more",
-    "videos short videos more",
-    "shopping videos short",
-    "people also ask",
-    "related searches",
-    "more results",
+    "short videos more", "images short videos more",
+    "videos short videos more", "shopping videos short",
+    "people also ask", "related searches", "more results",
     "try again later. thinking",
-    "feedback about this result",
-    "about this result",
+    "feedback about this result", "about this result",
     "cached similar",
 ]
+
+CIN_PATTERN = re.compile(r'[A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6}')
 
 
 def scraper_url(target_url: str, country: str = "in", render: bool = False) -> str:
@@ -72,18 +72,14 @@ def scraper_url(target_url: str, country: str = "in", render: bool = False) -> s
 
 
 def is_noise(text: str) -> bool:
-    text_lower = text.lower()
-    return any(phrase in text_lower for phrase in NOISE_PHRASES)
+    return any(phrase in text.lower() for phrase in NOISE_PHRASES)
 
 
 def is_google_noise(text: str) -> bool:
-    """Check if text is Google's own UI element rather than an actual search result."""
-    text_lower = text.lower().strip()
-    return any(phrase in text_lower for phrase in GOOGLE_UI_NOISE)
+    return any(phrase in text.lower().strip() for phrase in GOOGLE_UI_NOISE)
 
 
 def clean_blocks(html: str, min_len: int = 15, max_len: int = 300) -> list:
-    """Extract clean, meaningful text blocks — filter out navigation noise."""
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "head", "meta", "noscript"]):
         tag.decompose()
@@ -92,9 +88,7 @@ def clean_blocks(html: str, min_len: int = 15, max_len: int = 300) -> list:
     for tag in soup.find_all(["p", "h1", "h2", "h3", "h4", "li", "td", "span", "div", "a"]):
         text = tag.get_text(separator=" ", strip=True)
         text = re.sub(r'\s+', ' ', text)
-        if (min_len <= len(text) <= max_len
-                and text not in seen
-                and not is_noise(text)):
+        if min_len <= len(text) <= max_len and text not in seen and not is_noise(text):
             seen.add(text)
             blocks.append(text)
     return blocks[:60]
@@ -109,50 +103,12 @@ def company_mentioned(blocks: list, query: str) -> bool:
     return False
 
 
-async def scrape_supplier(query: str, website_url: str = None, email: str = None) -> dict:
-    tasks = [
-        _google_reviews(query),
-        _google_fraud(query),
-        _google_complaints(query),
-        _indiamart(query),
-        _tradeindia(query),
-        _justdial(query),
-        _mca_portal(query),
-        _zauba_corp(query),
-        _linkedin_presence(query),
-        _scam_databases(query),
-    ]
-    if website_url:
-        tasks.append(_website_analysis(website_url))
-    if email:
-        tasks.append(_email_domain_check(email))
-
-    results_list = await asyncio.gather(*tasks, return_exceptions=True)
-
-    keys = [
-        "google_reviews", "google_fraud", "google_complaints",
-        "indiamart", "tradeindia", "justdial",
-        "mca", "zauba", "linkedin", "scam_check"
-    ]
-    if website_url:
-        keys.append("website")
-    if email:
-        keys.append("email_check")
-
-    results = {}
-    for key, val in zip(keys, results_list):
-        results[key] = {"error": str(val), "source": key} if isinstance(val, Exception) else val
-    return results
-
-
-# ── GOOGLE (via ScraperAPI) ────────────────────────────────────────────────────
+# ── Core Google Search ────────────────────────────────────────────────────────
 
 def _extract_google_snippets(html: str) -> tuple:
-    """Extract real search result snippets and links from Google HTML.
-    Filters out Google's own UI noise."""
+    """Extract snippets and links from Google HTML."""
     soup = BeautifulSoup(html, "html.parser")
 
-    # Extract snippets — filter out Google UI noise
     snippets = []
     seen = set()
     for tag in soup.find_all(["div", "span", "p"]):
@@ -165,11 +121,9 @@ def _extract_google_snippets(html: str) -> tuple:
             seen.add(text)
             snippets.append(text)
 
-    # Extract links — handle multiple Google HTML formats
     links = []
     link_seen = set()
 
-    # Method 1: /url?q= format (classic)
     for a in soup.select("a[href]"):
         href = a.get("href", "")
         if "/url?q=" in href:
@@ -178,7 +132,6 @@ def _extract_google_snippets(html: str) -> tuple:
                 link_seen.add(real)
                 links.append(real)
 
-    # Method 2: Direct https links in result cards
     if not links:
         for a in soup.select("a[href^='http']"):
             href = a.get("href", "")
@@ -190,35 +143,199 @@ def _extract_google_snippets(html: str) -> tuple:
                 link_seen.add(href)
                 links.append(href)
 
-    # Method 3: data-href attributes
     for a in soup.select("a[data-href]"):
         href = a.get("data-href", "")
         if href.startswith("http") and "google" not in href and href not in link_seen:
             link_seen.add(href)
             links.append(href)
 
-    return snippets[:10], links[:8]
+    return snippets[:15], links[:12]
 
+
+async def _google_search_raw(query: str, num: int = 10) -> tuple:
+    """Execute a Google search via ScraperAPI with 1 retry. Returns (snippets, links, full_text)."""
+    target = f"https://www.google.com/search?q={quote_plus(query)}&num={num}&hl=en&gl=in"
+    url = scraper_url(target, country="in")
+    timeout = 15
+
+    for attempt in range(2):
+        try:
+            async with scraper_semaphore:
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                    resp = await client.get(url)
+                    if resp.status_code == 200:
+                        snippets, links = _extract_google_snippets(resp.text)
+                        return snippets, links, resp.text
+        except Exception:
+            if attempt == 1:
+                break
+            await asyncio.sleep(1)
+            timeout = 20  # Increase timeout slightly on second attempt
+            
+    return [], [], ""
+
+
+async def _google_search(query: str, source_name: str) -> dict:
+    """Wrapped Google search returning a dict."""
+    try:
+        snippets, links, _ = await _google_search_raw(query)
+        return {"source": source_name, "snippets": snippets, "links": links}
+    except Exception as e:
+        return {"source": source_name, "snippets": [], "links": [], "error": str(e)}
+
+
+# ── Website Discovery ─────────────────────────────────────────────────────────
+
+async def _discover_website(query: str) -> str:
+    """Discover the official website of a company via Google search.
+    Returns the website URL if found, or empty string."""
+    try:
+        search_query = f'{query} "official website" (India OR IN)'
+        snippets, links, full_text = await _google_search_raw(search_query, num=8)
+
+        query_words = [w.lower() for w in query.split() if len(w) > 2]
+
+        # Filter out marketplace/social/directory sites
+        skip_domains = [
+            "indiamart.com", "tradeindia.com", "justdial.com", "linkedin.com",
+            "facebook.com", "twitter.com", "instagram.com", "youtube.com",
+            "wikipedia.org", "zaubacorp.com", "mca.gov.in", "google.com",
+            "amazon.in", "amazon.com", "flipkart.com", "quora.com",
+            "glassdoor.co.in", "glassdoor.com", "ambitionbox.com",
+            "crunchbase.com", "reddit.com", "naukri.com",
+            "knowyourgst.com", "gstzen.in", "cleartax.in", "mastersindia.com",
+        ]
+
+        for link in links:
+            link_lower = link.lower()
+            # Skip known non-company domains
+            if any(d in link_lower for d in skip_domains):
+                continue
+            # Check if link looks like a company homepage
+            domain = link.split("//")[-1].split("/")[0].replace("www.", "").lower()
+            # Check if query words appear in domain or if it's a plausible company site
+            domain_parts = domain.replace(".", " ").replace("-", " ").lower()
+            if any(w in domain_parts for w in query_words) or len(links) <= 3:
+                return link
+
+        # Fallback: try the first non-skipped link
+        for link in links:
+            link_lower = link.lower()
+            if not any(d in link_lower for d in skip_domains):
+                return link
+
+    except Exception:
+        pass
+    return ""
+
+
+# ── Main Entry Point ──────────────────────────────────────────────────────────
+
+async def scrape_supplier(query: str, website_url: str = None, email: str = None) -> dict:
+    """
+    Run all checks in parallel. Combined searches reduce total API calls:
+    1. Google reviews         (1 search)
+    2. Google fraud           (1 search)
+    3. Google complaints      (1 search)
+    4. Marketplace presence   (1 search → indiamart + tradeindia + justdial)
+    5. Company registration   (1 search → mca + zauba)
+    6. LinkedIn presence      (1 search)
+    7. Scam databases         (1 search)
+    8. Website discovery+analysis (1-2 searches if no URL provided)
+    """
+    # Phase 1: Run core searches + website discovery in parallel
+    tasks = [
+        _google_reviews(query),           # 0
+        _google_fraud(query),             # 1
+        _google_complaints(query),        # 2
+        _marketplace_presence(query),     # 3 → {"indiamart": ..., "tradeindia": ..., "justdial": ...}
+        _company_registration(query),     # 4 → {"mca": ..., "zauba": ...}
+        _linkedin_presence(query),        # 5
+        _scam_databases(query),           # 6
+    ]
+
+    # If website URL is provided, analyze it directly; otherwise, discover it
+    if website_url:
+        tasks.append(_website_analysis(website_url))  # 7
+    else:
+        tasks.append(_discover_website(query))        # 7 → returns URL string
+
+    if email:
+        tasks.append(_email_domain_check(email))      # 8 (or 7+1)
+
+    results_list = await asyncio.gather(*tasks, return_exceptions=True)
+
+    def safe(val, default):
+        return default if isinstance(val, Exception) else val
+
+    results = {}
+
+    # Simple 1:1 mapped results
+    results["google_reviews"] = safe(results_list[0], {"source": "Google Reviews", "snippets": [], "links": []})
+    results["google_fraud"] = safe(results_list[1], {"source": "Google Fraud Check", "snippets": [], "links": []})
+    results["google_complaints"] = safe(results_list[2], {"source": "Google Complaints", "snippets": [], "links": []})
+
+    # Unpack combined marketplace result → 3 separate keys
+    marketplace = safe(results_list[3], {})
+    results["indiamart"] = marketplace.get("indiamart", {"source": "IndiaMART", "found": False})
+    results["tradeindia"] = marketplace.get("tradeindia", {"source": "TradeIndia", "found": False})
+    results["justdial"] = marketplace.get("justdial", {"source": "Justdial", "found": False})
+
+    # Unpack combined registration result → 2 separate keys
+    registration = safe(results_list[4], {})
+    results["mca"] = registration.get("mca", {"source": "MCA Portal", "found": False})
+    results["zauba"] = registration.get("zauba", {"source": "Zauba Corp", "found": False})
+
+    results["linkedin"] = safe(results_list[5], {"source": "LinkedIn", "profile_found": False})
+    results["scam_check"] = safe(results_list[6], {"source": "Scam/Blacklist Check", "risk_level": "UNKNOWN"})
+
+    # Handle website: either direct analysis result or discovered URL needing analysis
+    idx = 7
+    website_result = safe(results_list[idx], None)
+    if website_url:
+        # Direct website analysis was run
+        results["website"] = website_result or {"source": "Website Analysis", "accessible": False}
+    else:
+        # Website discovery was run — analyze the discovered URL
+        if isinstance(website_result, str) and website_result:
+            try:
+                results["website"] = await _website_analysis(website_result)
+            except Exception:
+                results["website"] = {"source": "Website Analysis", "url": website_result, "accessible": False,
+                                      "discovered": True, "error": "Could not analyze discovered website"}
+        else:
+            results["website"] = {"source": "Website Analysis", "accessible": False,
+                                  "not_discovered": True}
+    idx += 1
+
+    if email:
+        results["email_check"] = safe(results_list[idx], {"source": "Email Domain Check", "flags": []})
+
+    return results
+
+
+# ── GOOGLE REVIEWS / FRAUD / COMPLAINTS (3 searches) ────────────────────────
 
 async def _google_reviews(query: str) -> dict:
-    return await _google_search(
-        f"{query} supplier India reviews site:indiamart.com OR site:tradeindia.com OR site:justdial.com",
-        "Google Reviews"
-    )
+    return await _google_search(f"{query} reviews ratings India", "Google Reviews")
 
 
 async def _google_fraud(query: str) -> dict:
-    data = await _google_search(f"{query} fraud scam fake complaints India", "Google Fraud Check")
-    fraud_kw = ["fraud", "scam", "fake", "cheated", "complaint", "loss", "beware", "warning", "cheat", "duped"]
-    snippets = data.get("snippets", [])
-    # Only count snippets that are actual content, not search query echoes
+    data = await _google_search(f"{query} fraud scam fake India", "Google Fraud Check")
+    fraud_kw = ["fraud", "scam", "fake", "cheated", "loss", "beware", "warning", "cheat", "duped"]
+    consumer_noise = [
+        "delivery", "refund", "return", "app", "order", "customer care",
+        "expired", "damaged", "wrong product", "cancelled", "customer service",
+        "helpline", "consumer forum", "poor quality", "uninstall",
+    ]
     flags = []
-    for s in snippets:
+    for s in data.get("snippets", []):
         s_lower = s.lower()
-        # Skip snippets that are just echoing the search query
         if s_lower.startswith("press") or "jump to" in s_lower:
             continue
         if any(kw in s_lower for kw in fraud_kw):
+            if any(cn in s_lower for cn in consumer_noise):
+                continue
             flags.append(s)
     data["fraud_mentions"] = len(flags)
     data["fraud_snippets"] = flags[:3]
@@ -227,10 +344,10 @@ async def _google_fraud(query: str) -> dict:
 
 async def _google_complaints(query: str) -> dict:
     data = await _google_search(f"{query} complaint consumer forum India", "Google Complaints")
-    complaint_kw = ["complaint", "issue", "problem", "refund", "cheated", "not delivered", "poor quality"]
-    snippets = data.get("snippets", [])
+    complaint_kw = ["cheated", "not delivered", "advance payment", "money lost",
+                    "fake supplier", "no response", "absconded", "fraud"]
     flags = []
-    for s in snippets:
+    for s in data.get("snippets", []):
         s_lower = s.lower()
         if s_lower.startswith("press") or "jump to" in s_lower:
             continue
@@ -241,312 +358,281 @@ async def _google_complaints(query: str) -> dict:
     return data
 
 
-async def _google_search(query: str, source_name: str) -> dict:
-    target = f"https://www.google.com/search?q={query.replace(' ', '+')}&num=10&hl=en&gl=in"
-    url = scraper_url(target, country="in")
-    try:
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
-            resp = await client.get(url)
-            snippets, links = _extract_google_snippets(resp.text)
-            return {"source": source_name, "snippets": snippets, "links": links}
-    except Exception as e:
-        return {"source": source_name, "snippets": [], "links": [], "error": str(e)}
+# ── B2B MARKETPLACE PRESENCE (1 search → 3 sources) ─────────────────────────
 
-
-# ── INDIAMART ─────────────────────────────────────────────────────────────────
-
-async def _indiamart(query: str) -> dict:
-    target = f"https://dir.indiamart.com/search.mp?ss={query.replace(' ', '+')}"
-    try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            resp = await client.get(scraper_url(target))
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            # Extract company cards more specifically
-            blocks = clean_blocks(resp.text, min_len=10)
-            found = company_mentioned(blocks, query)
-
-            ratings = [b for b in blocks if any(x in b for x in ["★", "/5", "Rated", "stars"]) and len(b) < 80]
-            years = [b for b in blocks if re.search(r'(since|est\.?|established)\s*\d{4}', b.lower())]
-            verified = [b for b in blocks if "verified" in b.lower() and len(b) < 60]
-
-            # Extract company names — be more lenient with matching
-            query_words = [w.lower() for w in query.split() if len(w) > 1]
-            companies = []
-            for b in blocks:
-                b_lower = b.lower()
-                if (any(w in b_lower for w in query_words)
-                        and 8 < len(b) < 120
-                        and not is_noise(b)):
-                    companies.append(b)
-            companies = companies[:8]
-
-            # Also check page title for confirmation
-            title = soup.title.get_text() if soup.title else ""
-            title_has_query = any(w in title.lower() for w in query_words)
-
-            return {
-                "source": "IndiaMART",
-                "companies_found": companies,
-                "ratings": ratings[:3],
-                "years_listed": years[:2],
-                "verified_count": len(verified),
-                "found": found or len(companies) > 0 or title_has_query,
-            }
-    except Exception as e:
-        return {"source": "IndiaMART", "error": str(e), "found": False}
-
-
-# ── TRADEINDIA ────────────────────────────────────────────────────────────────
-
-async def _tradeindia(query: str) -> dict:
-    target = f"https://www.tradeindia.com/search/?q={query.replace(' ', '+')}&cat=company"
-    try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            resp = await client.get(scraper_url(target))
-            blocks = clean_blocks(resp.text, min_len=10)
-            found = company_mentioned(blocks, query)
-            verified = [b for b in blocks if "verified" in b.lower() and len(b) < 60]
-
-            query_words = [w.lower() for w in query.split() if len(w) > 1]
-            companies = [
-                b for b in blocks
-                if any(w in b.lower() for w in query_words)
-                and 8 < len(b) < 120
-            ][:5]
-
-            return {
-                "source": "TradeIndia",
-                "companies_found": companies,
-                "verified_count": len(verified),
-                "found": found or len(companies) > 0,
-            }
-    except Exception as e:
-        return {"source": "TradeIndia", "error": str(e), "found": False}
-
-
-# ── JUSTDIAL ──────────────────────────────────────────────────────────────────
-
-async def _justdial(query: str) -> dict:
-    # Use the correct Justdial search URL
-    target = f"https://www.justdial.com/search?q={query.replace(' ', '+')}"
-    try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            resp = await client.get(scraper_url(target))
-            blocks = clean_blocks(resp.text, min_len=10)
-            found = company_mentioned(blocks, query)
-
-            query_words = [w.lower() for w in query.split() if len(w) > 1]
-
-            # Filter out Justdial UI noise
-            jd_noise = ["jd user rating", "are you sure", "delete this rating", "your rating/review"]
-            ratings = [
-                b for b in blocks
-                if any(x in b for x in ["★", "Rated", "/5", "Rating"])
-                and len(b) < 80
-                and not any(n in b.lower() for n in jd_noise)
-            ]
-
-            businesses = [
-                b for b in blocks
-                if any(w in b.lower() for w in query_words)
-                and 8 < len(b) < 120
-                and not any(n in b.lower() for n in jd_noise)
-            ][:5]
-
-            return {
-                "source": "Justdial",
-                "businesses_found": businesses,
-                "ratings": ratings[:3],
-                "found": found or len(businesses) > 0,
-            }
-    except Exception as e:
-        return {"source": "Justdial", "error": str(e), "found": False}
-
-
-# ── MCA PORTAL ────────────────────────────────────────────────────────────────
-
-async def _mca_portal(query: str) -> dict:
-    search_target = f"https://efiling.mca.gov.in/efs-filing/rest/getCompanyINC/getCompanyDetails?companyName={query.replace(' ', '%20')}&companyType=&roc="
-
-    cin_pattern = re.compile(r'[A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6}')
+async def _marketplace_presence(query: str) -> dict:
+    """ONE Google search checks IndiaMART + TradeIndia + Justdial simultaneously.
+    This is the key optimization — 1 API call instead of 3-6."""
+    search_query = f'{query} (site:indiamart.com OR site:tradeindia.com OR site:justdial.com)'
 
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            # Try the JSON API first (via ScraperAPI)
-            resp = await client.get(scraper_url(search_target))
-            try:
-                data = resp.json()
-                if isinstance(data, list) and len(data) > 0:
-                    companies = []
-                    for c in data[:5]:
-                        name = c.get("companyName") or c.get("company_name", "")
-                        if name and any(w.lower() in name.lower() for w in query.split() if len(w) > 2):
-                            companies.append({
-                                "name": name,
-                                "cin": c.get("cin", "N/A"),
-                                "status": c.get("companyStatus", c.get("status", "N/A")),
-                                "incorporation_date": c.get("dateOfIncorporation", "N/A"),
-                                "type": c.get("companyType", "N/A"),
-                                "state": c.get("registeredState", "N/A"),
-                            })
-                    if companies:
-                        return {"source": "MCA Portal", "companies": companies, "found": True}
-            except Exception:
-                pass
+        snippets, links, full_text = await _google_search_raw(search_query, num=15)
+    except Exception:
+        return {
+            "indiamart": {"source": "IndiaMART", "found": False, "companies_found": [], "ratings": [], "years_listed": [], "verified_count": 0},
+            "tradeindia": {"source": "TradeIndia", "found": False, "companies_found": [], "verified_count": 0},
+            "justdial": {"source": "Justdial", "found": False, "businesses_found": [], "ratings": []},
+        }
 
-            # Fallback: Zauba Corp mirrors MCA data
-            zauba_target = f"https://www.zaubacorp.com/company-list/p-1/company-name-{query.replace(' ', '-').upper()}.html"
-            resp3 = await client.get(scraper_url(zauba_target))
-            blocks3 = clean_blocks(resp3.text)
-            cin_found = []
-            for block in blocks3:
-                cin_match = cin_pattern.search(block)
-                if cin_match:
-                    name_part = block.replace(cin_match.group(), "").strip()
-                    cin_found.append({
-                        "name": name_part[:80] or query,
-                        "cin": cin_match.group(),
-                        "status": "N/A",
-                        "incorporation_date": "N/A",
-                        "type": "N/A",
-                        "state": "N/A",
-                    })
+    query_words = [w.lower() for w in query.split() if len(w) > 1]
 
-            return {
-                "source": "MCA Portal",
-                "companies": cin_found[:5],
-                "found": len(cin_found) > 0,
-            }
-    except Exception as e:
-        return {"source": "MCA Portal", "error": str(e), "found": False}
+    # Classify links by source
+    im_links = [l for l in links if "indiamart.com" in l]
+    ti_links = [l for l in links if "tradeindia.com" in l]
+    jd_links = [l for l in links if "justdial.com" in l]
+
+    # Classify snippets by checking which source link appeared nearby
+    # Since we can't easily map snippet-to-link, use keyword heuristics
+    im_companies, im_ratings, im_verified = [], [], []
+    ti_companies, ti_verified = [], []
+    jd_businesses, jd_ratings = [], []
+
+    for s in snippets:
+        s_lower = s.lower()
+        has_query = any(w in s_lower for w in query_words)
+
+        # Determine which source this snippet belongs to
+        is_indiamart = "indiamart" in s_lower or "dir.indiamart" in s_lower
+        is_tradeindia = "tradeindia" in s_lower
+        is_justdial = "justdial" in s_lower or "jd" in s_lower
+
+        if is_indiamart:
+            if has_query and 10 < len(s) < 250:
+                im_companies.append(s)
+            if any(x in s_lower for x in ["★", "/5", "rated", "stars", "rating"]):
+                im_ratings.append(s)
+            if any(v in s_lower for v in ["verified", "trustseal", "gst verified"]):
+                im_verified.append(s)
+        elif is_tradeindia:
+            if has_query and 10 < len(s) < 250:
+                ti_companies.append(s)
+            if "verified" in s_lower:
+                ti_verified.append(s)
+        elif is_justdial:
+            if has_query and 10 < len(s) < 250:
+                jd_businesses.append(s)
+            if any(x in s_lower for x in ["★", "rated", "/5", "rating", "star"]):
+                jd_ratings.append(s)
+        else:
+            # Generic snippet — assign based on whether query matches
+            if has_query and 10 < len(s) < 200:
+                # Check full page text for context clues
+                if any(x in s_lower for x in ["verified", "trustseal"]):
+                    im_verified.append(s)
+
+    # Also check full page text for mentions
+    full_lower = full_text.lower()
+    im_in_page = "indiamart" in full_lower
+    ti_in_page = "tradeindia" in full_lower
+    jd_in_page = "justdial" in full_lower
+
+    return {
+        "indiamart": {
+            "source": "IndiaMART",
+            "companies_found": im_companies[:8],
+            "ratings": im_ratings[:3],
+            "years_listed": [],
+            "verified_count": len(im_verified),
+            "found": len(im_links) > 0 or len(im_companies) > 0 or im_in_page,
+        },
+        "tradeindia": {
+            "source": "TradeIndia",
+            "companies_found": ti_companies[:5],
+            "verified_count": len(ti_verified),
+            "found": len(ti_links) > 0 or len(ti_companies) > 0 or ti_in_page,
+        },
+        "justdial": {
+            "source": "Justdial",
+            "businesses_found": jd_businesses[:5],
+            "ratings": jd_ratings[:3],
+            "found": len(jd_links) > 0 or len(jd_businesses) > 0 or jd_in_page,
+        },
+    }
 
 
-# ── ZAUBA CORP ────────────────────────────────────────────────────────────────
+# ── COMPANY REGISTRATION (1 search → MCA + Zauba) ───────────────────────────
 
-async def _zauba_corp(query: str) -> dict:
-    target = f"https://www.zaubacorp.com/company-list/p-1/company-name-{query.replace(' ', '-').upper()}.html"
-    cin_pattern = re.compile(r'[A-Z]\d{5}[A-Z]{2}\d{4}[A-Z]{3}\d{6}')
+async def _company_registration(query: str) -> dict:
+    """ONE Google search checks MCA + Zauba Corp for company registration.
+    Searches for CIN numbers, incorporation details, and company status."""
+    search_query = f'{query} company CIN India (site:zaubacorp.com OR site:mca.gov.in OR "private limited" OR "limited")'
+
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            resp = await client.get(scraper_url(target))
-            blocks = clean_blocks(resp.text)
-            found = company_mentioned(blocks, query)
+        snippets, links, full_text = await _google_search_raw(search_query, num=15)
+    except Exception:
+        return {
+            "mca": {"source": "MCA Portal", "found": False, "companies": []},
+            "zauba": {"source": "Zauba Corp", "found": False, "companies": []},
+        }
 
-            companies = []
-            for block in blocks:
-                cin_match = cin_pattern.search(block)
-                if cin_match:
-                    name_part = re.sub(cin_pattern, '', block).strip()
-                    if any(w.lower() in name_part.lower() for w in query.split() if len(w) > 2):
-                        companies.append({
-                            "name": name_part[:80] or query,
-                            "cin": cin_match.group(),
-                            "status": "N/A",
-                            "incorporation": "N/A",
-                        })
+    query_words = [w.lower() for w in query.split() if len(w) > 2]
 
-            return {
-                "source": "Zauba Corp",
-                "companies": companies[:5],
-                "found": found or len(companies) > 0,
-            }
-    except Exception as e:
-        return {"source": "Zauba Corp", "error": str(e), "found": False}
+    # Extract CIN numbers from full page text
+    cin_matches = list(set(CIN_PATTERN.findall(full_text)))
+
+    # Classify links
+    mca_links = [l for l in links if "mca.gov.in" in l]
+    zauba_links = [l for l in links if "zaubacorp.com" in l]
+
+    full_lower = full_text.lower()
+    mca_in_page = "mca.gov.in" in full_lower or "ministry of corporate" in full_lower
+    zauba_in_page = "zaubacorp.com" in full_lower
+
+    # Build companies list from CIN matches
+    mca_companies = []
+    zauba_companies = []
+    seen_cin = set()
+
+    for cin in cin_matches[:5]:
+        if cin in seen_cin:
+            continue
+        seen_cin.add(cin)
+        company = {
+            "name": query.upper(),
+            "cin": cin,
+            "status": "Found via web search",
+            "incorporation_date": "N/A",
+            "type": "N/A",
+            "state": "N/A",
+        }
+        mca_companies.append(company)
+        zauba_companies.append({
+            "name": query.upper(),
+            "cin": cin,
+            "status": "N/A",
+            "incorporation": "N/A",
+        })
+
+    # Check snippets for company registration keywords even without CIN
+    mca_keywords = ["incorporated", "incorporation", "registered company",
+                    "private limited", "pvt ltd", "llp", "limited liability",
+                    "ministry of corporate", "registrar of companies",
+                    "active", "registered"]
+
+    if not mca_companies:
+        for s in snippets:
+            s_lower = s.lower()
+            if (any(w in s_lower for w in query_words) and
+                    any(kw in s_lower for kw in mca_keywords)):
+                cin_in_s = CIN_PATTERN.search(s)
+                mca_companies.append({
+                    "name": query.upper(),
+                    "cin": cin_in_s.group() if cin_in_s else "N/A",
+                    "status": "Registration info found in web results",
+                    "incorporation_date": "N/A",
+                    "type": "N/A",
+                    "state": "N/A",
+                })
+                break
+
+    # Zauba-specific snippets
+    if not zauba_companies:
+        for s in snippets:
+            s_lower = s.lower()
+            if "zaubacorp" in s_lower and any(w in s_lower for w in query_words):
+                cin_in_s = CIN_PATTERN.search(s)
+                zauba_companies.append({
+                    "name": s[:80] if len(s) < 80 else query.upper(),
+                    "cin": cin_in_s.group() if cin_in_s else "N/A",
+                    "status": "Found on Zauba Corp",
+                    "incorporation": "N/A",
+                })
+                break
+
+    return {
+        "mca": {
+            "source": "MCA Portal",
+            "companies": mca_companies[:5],
+            "found": len(mca_companies) > 0 or len(mca_links) > 0 or mca_in_page,
+        },
+        "zauba": {
+            "source": "Zauba Corp",
+            "companies": zauba_companies[:5],
+            "found": len(zauba_companies) > 0 or len(zauba_links) > 0 or zauba_in_page,
+        },
+    }
 
 
-# ── LINKEDIN (via ScraperAPI Google search) ───────────────────────────────────
+# ── LINKEDIN (1 search) ──────────────────────────────────────────────────────
 
 async def _linkedin_presence(query: str) -> dict:
-    target = f'https://www.google.com/search?q="{query.replace(" ", "+")}" site:linkedin.com/company&gl=in'
-    url = scraper_url(target, country="in")
+    """Check LinkedIn company presence via Google — single optimized search."""
+    search_query = f'{query} site:linkedin.com/company OR site:in.linkedin.com/company'
     try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            resp = await client.get(url)
-            soup = BeautifulSoup(resp.text, "html.parser")
+        snippets, links, full_text = await _google_search_raw(search_query)
 
-            linkedin_links = []
+        linkedin_links = [l for l in links if "linkedin.com" in l]
+        company_links = [l for l in linkedin_links if "/company" in l]
 
-            # Method 1: /url?q= format
-            for a in soup.select("a[href]"):
-                href = a.get("href", "")
-                if "/url?q=" in href:
-                    real = href.split("/url?q=")[1].split("&")[0]
-                    if "linkedin.com/company" in real:
-                        linkedin_links.append(real)
+        # Extract relevant snippets
+        query_words = [w.lower() for w in query.split() if len(w) > 1]
+        relevant_snippets = []
+        for s in snippets:
+            s_lower = s.lower()
+            if (any(w in s_lower for w in query_words) or "linkedin" in s_lower):
+                if 20 < len(s) < 300 and not is_noise(s):
+                    relevant_snippets.append(s)
 
-            # Method 2: Direct links
-            if not linkedin_links:
-                for a in soup.select("a[href*='linkedin.com/company']"):
-                    href = a.get("href", "")
-                    if href.startswith("http") and "linkedin.com/company" in href:
-                        linkedin_links.append(href)
+        full_lower = full_text.lower()
+        has_linkedin = "linkedin.com/company" in full_lower or len(company_links) > 0
 
-            # Method 3: Check page text for linkedin company mentions
-            page_text = soup.get_text().lower()
-            has_linkedin_mention = "linkedin.com/company" in page_text or "linkedin" in page_text
-
-            snippets = []
-            for tag in soup.find_all(["div", "span"]):
-                text = tag.get_text(separator=" ", strip=True)
-                if ("linkedin" in text.lower()
-                        and 20 < len(text) < 300
-                        and not is_noise(text)
-                        and not is_google_noise(text)):
-                    snippets.append(text)
-
-            return {
-                "source": "LinkedIn",
-                "profile_found": len(linkedin_links) > 0 or has_linkedin_mention,
-                "links": linkedin_links[:3],
-                "snippets": snippets[:3],
-            }
+        return {
+            "source": "LinkedIn",
+            "profile_found": has_linkedin or len(linkedin_links) > 0 or len(relevant_snippets) > 0,
+            "links": (company_links or linkedin_links)[:3],
+            "snippets": relevant_snippets[:3],
+        }
     except Exception as e:
         return {"source": "LinkedIn", "profile_found": False, "error": str(e)}
 
 
-# ── SCAM DATABASES (parallel queries) ────────────────────────────────────────
-
-async def _scam_single_query(client: httpx.AsyncClient, query: str) -> tuple:
-    """Run a single scam-related Google search."""
-    target = f"https://www.google.com/search?q={query.replace(' ', '+')}&num=5&gl=in"
-    try:
-        resp = await client.get(scraper_url(target, country="in"))
-        snippets, _ = _extract_google_snippets(resp.text)
-        return snippets
-    except Exception:
-        return []
-
+# ── SCAM DATABASES (1 combined search instead of 2) ─────────────────────────
 
 async def _scam_databases(query: str) -> dict:
-    queries = [
-        f"{query} scam fraud India",
-        f"{query} complaint cheated supplier review",
-    ]
-    all_snippets = []
+    """Check for genuine B2B fraud signals — single Google search."""
+    search_query = f'{query} scam fraud cheated supplier India'
     all_flags = []
-    fraud_kw = ["scam", "fraud", "fake", "cheat", "complaint", "beware",
-                "warning", "not genuine", "money lost", "not delivered", "duped"]
-    try:
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
-            # Run queries in parallel instead of sequential
-            tasks = [_scam_single_query(client, q) for q in queries]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            for result in results:
-                if isinstance(result, Exception):
-                    continue
-                for text in result:
-                    all_snippets.append(text)
-                    if any(kw in text.lower() for kw in fraud_kw):
-                        all_flags.append(text)
+    b2b_fraud_kw = [
+        "fake company", "shell company", "ponzi", "absconded", "disappeared",
+        "took money", "no delivery", "blacklisted", "arrested", "fir filed",
+        "police case", "court order", "winding up", "struck off",
+        "not genuine", "money lost", "duped", "advance payment",
+    ]
+    general_kw = ["scam", "fraud", "fake", "cheat", "beware", "warning"]
+    consumer_noise = [
+        "delivery", "refund", "return", "app", "order", "customer care",
+        "expired", "damaged", "late delivery", "wrong product", "cancelled",
+        "customer service", "helpline", "grievance", "consumer forum",
+        "poor quality", "bad experience", "worst service", "don't buy",
+        "1 star", "uninstall",
+    ]
+
+    try:
+        snippets, links, _ = await _google_search_raw(search_query, num=10)
+
+        for text in snippets:
+            t = text.lower()
+            if any(kw in t for kw in b2b_fraud_kw):
+                all_flags.append(text)
+            elif any(kw in t for kw in general_kw):
+                if not any(cn in t for cn in consumer_noise):
+                    all_flags.append(text)
+
+        genuine_flags = len(all_flags)
+        if genuine_flags >= 3:
+            risk = "HIGH"
+        elif genuine_flags >= 1:
+            risk = "MEDIUM"
+        else:
+            risk = "LOW"
 
         return {
             "source": "Scam/Blacklist Check",
-            "total_snippets": len(all_snippets),
-            "fraud_flags": len(all_flags),
+            "total_snippets": len(snippets),
+            "fraud_flags": genuine_flags,
             "flagged_snippets": list(set(all_flags))[:4],
-            "risk_level": "HIGH" if len(all_flags) >= 3 else "MEDIUM" if len(all_flags) >= 1 else "LOW",
+            "risk_level": risk,
         }
     except Exception as e:
         return {"source": "Scam/Blacklist Check", "error": str(e), "risk_level": "UNKNOWN"}
@@ -574,23 +660,24 @@ async def _website_analysis(target_url: str) -> dict:
         free_domains = ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "rediffmail.com"]
         result["has_professional_domain"] = domain not in free_domains
 
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            resp = await client.get(scraper_url(target_url))
-            result["accessible"] = resp.status_code == 200
-            blocks = clean_blocks(resp.text)
-            all_text = " ".join(blocks).lower()
+        async with scraper_semaphore:
+            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                resp = await client.get(scraper_url(target_url))
+        
+        result["accessible"] = resp.status_code == 200
+        blocks = clean_blocks(resp.text)
+        all_text = " ".join(blocks).lower()
 
-            result["has_contact_info"] = any(kw in all_text for kw in ["contact", "phone", "email", "call us", "reach us"])
-            result["has_address"] = any(kw in all_text for kw in ["address", "location", "office", "headquarter", "plot", "sector"])
-            result["has_about_page"] = any(kw in all_text for kw in ["about us", "our company", "who we are"])
-            result["has_product_catalog"] = any(kw in all_text for kw in ["product", "catalogue", "catalog", "price list"])
+        result["has_contact_info"] = any(kw in all_text for kw in ["contact", "phone", "email", "call us", "reach us"])
+        result["has_address"] = any(kw in all_text for kw in ["address", "location", "office", "headquarter", "plot", "sector"])
+        result["has_about_page"] = any(kw in all_text for kw in ["about us", "our company", "who we are"])
+        result["has_product_catalog"] = any(kw in all_text for kw in ["product", "catalogue", "catalog", "price list"])
 
-            if not result["has_contact_info"]:
-                result["flags"].append("No contact information found")
-            if not result["has_address"]:
-                result["flags"].append("No physical address found")
+        if not result["has_contact_info"]:
+            result["flags"].append("No contact information found")
+        if not result["has_address"]:
+            result["flags"].append("No physical address found")
 
-        # WHOIS domain age
         try:
             async with httpx.AsyncClient(timeout=8) as client:
                 whois_resp = await client.get(f"https://api.whois.vu/?q={domain}&format=json")
